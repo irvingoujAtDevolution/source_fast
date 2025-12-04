@@ -1,5 +1,6 @@
 use std::io;
 
+use bincode::error::{DecodeError, EncodeError};
 use rusqlite::Error as SqliteError;
 use thiserror::Error;
 
@@ -15,8 +16,14 @@ pub enum IndexError {
     Encode(String),
 }
 
-impl From<Box<bincode::ErrorKind>> for IndexError {
-    fn from(err: Box<bincode::ErrorKind>) -> Self {
+impl From<EncodeError> for IndexError {
+    fn from(err: EncodeError) -> Self {
+        IndexError::Encode(err.to_string())
+    }
+}
+
+impl From<DecodeError> for IndexError {
+    fn from(err: DecodeError) -> Self {
         IndexError::Encode(err.to_string())
     }
 }

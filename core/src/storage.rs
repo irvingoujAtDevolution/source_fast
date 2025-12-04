@@ -4,10 +4,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use bincode;
+use bincode::config;
 use roaring::RoaringBitmap;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use tracing::error;
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use tracing::{debug, error};
 
 use crate::error::{IndexError, IndexResult};
 use crate::model::SearchHit;
@@ -217,7 +217,9 @@ fn upsert_file<'conn>(
         .optional()?;
 
     if let Some(blob) = old_trigrams_blob {
-        let old_trigrams: Vec<[u8; 3]> = bincode::deserialize(&blob)?;
+        let config = config::standard();
+        let (old_trigrams, _) =
+            bincode::serde::decode_from_slice::<Vec<[u8; 3]>, _>(&blob, config)?;
 
         for trigram in old_trigrams {
             let key = trigram;
@@ -231,12 +233,15 @@ fn upsert_file<'conn>(
                 .optional()?;
 
             if let Some(bitmap_blob) = bitmap_blob_opt {
-                let mut bitmap: RoaringBitmap = bincode::deserialize(&bitmap_blob)?;
+                let config = config::standard();
+                let (mut bitmap, _) =
+                    bincode::serde::decode_from_slice::<RoaringBitmap, _>(&bitmap_blob, config)?;
                 bitmap.remove(file_id);
                 if bitmap.is_empty() {
                     tx.execute("DELETE FROM trigrams WHERE trigram = ?1", [&key[..]])?;
                 } else {
-                    let encoded = bincode::serialize(&bitmap)?;
+                    let config = config::standard();
+                    let encoded = bincode::serde::encode_to_vec(&bitmap, config)?;
                     tx.execute(
                         "UPDATE trigrams SET file_ids = ?1 WHERE trigram = ?2",
                         params![encoded, &key[..]],
@@ -246,7 +251,8 @@ fn upsert_file<'conn>(
         }
     }
 
-    let encoded_trigrams = bincode::serialize(trigrams)?;
+    let config = config::standard();
+    let encoded_trigrams = bincode::serde::encode_to_vec(trigrams, config)?;
     tx.execute(
         "INSERT INTO file_trigrams (file_id, trigrams) VALUES (?1, ?2)
          ON CONFLICT(file_id) DO UPDATE SET trigrams = excluded.trigrams",
@@ -265,14 +271,18 @@ fn upsert_file<'conn>(
             .optional()?;
 
         let mut bitmap = if let Some(bitmap_blob) = bitmap_blob_opt {
-            bincode::deserialize::<RoaringBitmap>(&bitmap_blob)?
+            let config = config::standard();
+            let (bm, _) =
+                bincode::serde::decode_from_slice::<RoaringBitmap, _>(&bitmap_blob, config)?;
+            bm
         } else {
             RoaringBitmap::new()
         };
 
         bitmap.insert(file_id);
 
-        let encoded_bitmap = bincode::serialize(&bitmap)?;
+        let config = config::standard();
+        let encoded_bitmap = bincode::serde::encode_to_vec(&bitmap, config)?;
         tx.execute(
             "INSERT INTO trigrams (trigram, file_ids) VALUES (?1, ?2)
              ON CONFLICT(trigram) DO UPDATE SET file_ids = excluded.file_ids",
@@ -302,7 +312,9 @@ fn remove_file<'conn>(
         .optional()?;
 
     if let Some(blob) = old_trigrams_blob {
-        let old_trigrams: Vec<[u8; 3]> = bincode::deserialize(&blob)?;
+        let config = config::standard();
+        let (old_trigrams, _) =
+            bincode::serde::decode_from_slice::<Vec<[u8; 3]>, _>(&blob, config)?;
 
         for trigram in old_trigrams {
             let key = trigram;
@@ -316,12 +328,15 @@ fn remove_file<'conn>(
                 .optional()?;
 
             if let Some(bitmap_blob) = bitmap_blob_opt {
-                let mut bitmap: RoaringBitmap = bincode::deserialize(&bitmap_blob)?;
+                let config = config::standard();
+                let (mut bitmap, _) =
+                    bincode::serde::decode_from_slice::<RoaringBitmap, _>(&bitmap_blob, config)?;
                 bitmap.remove(file_id);
                 if bitmap.is_empty() {
                     tx.execute("DELETE FROM trigrams WHERE trigram = ?1", [&key[..]])?;
                 } else {
-                    let encoded = bincode::serialize(&bitmap)?;
+                    let config = config::standard();
+                    let encoded = bincode::serde::encode_to_vec(&bitmap, config)?;
                     tx.execute(
                         "UPDATE trigrams SET file_ids = ?1 WHERE trigram = ?2",
                         params![encoded, &key[..]],
@@ -344,7 +359,10 @@ fn writer_loop(mut storage: SqliteStorage, rx: mpsc::Receiver<IndexJob>) {
     loop {
         let first = match rx.recv() {
             Ok(job) => job,
-            Err(_) => break,
+            Err(_) => {
+                debug!("writer_loop: sender dropped, exiting");
+                break;
+            }
         };
 
         let mut batch = Vec::with_capacity(128);
@@ -354,10 +372,14 @@ fn writer_loop(mut storage: SqliteStorage, rx: mpsc::Receiver<IndexJob>) {
             match rx.try_recv() {
                 Ok(job) => batch.push(job),
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    debug!("writer_loop: channel disconnected while draining");
+                    return;
+                }
             }
         }
 
+        debug!("writer_loop: processing batch of {} jobs", batch.len());
         process_batch(&mut storage, batch);
     }
 }
@@ -377,6 +399,9 @@ fn process_batch(storage: &mut SqliteStorage, batch: Vec<IndexJob>) {
 
     let ids = &mut storage.ids;
     let mut batch_error: Option<IndexError> = None;
+    let mut upserts = 0usize;
+    let mut removes = 0usize;
+    let mut flushes = 0usize;
 
     for job in &batch {
         match &job.payload {
@@ -385,20 +410,29 @@ fn process_batch(storage: &mut SqliteStorage, batch: Vec<IndexJob>) {
                 modified_ts,
                 trigrams,
             } => {
+                upserts += 1;
                 if let Err(err) = upsert_file(ids, &tx, path, *modified_ts, trigrams.as_slice()) {
                     batch_error = Some(err);
                     break;
                 }
             }
             RemoveFile { path } => {
+                removes += 1;
                 if let Err(err) = remove_file(ids, &tx, path) {
                     batch_error = Some(err);
                     break;
                 }
             }
-            Flush => {}
+            Flush => {
+                flushes += 1;
+            }
         }
     }
+
+    debug!(
+        "process_batch: upserts={}, removes={}, flushes={}",
+        upserts, removes, flushes
+    );
 
     if let Some(err) = batch_error {
         drop(tx);
@@ -413,6 +447,8 @@ fn process_batch(storage: &mut SqliteStorage, batch: Vec<IndexJob>) {
         broadcast_batch_error(batch, err);
         return;
     }
+
+    debug!("process_batch: commit succeeded");
 
     for job in batch {
         let _ = job.resp.send(Ok(()));
@@ -475,7 +511,8 @@ fn search_with_conn(conn: &Connection, query: &str) -> IndexResult<Vec<SearchHit
         let Some(blob) = blob_opt else {
             return Ok(Vec::new());
         };
-        let bitmap: RoaringBitmap = bincode::deserialize(&blob)?;
+        let config = config::standard();
+        let (bitmap, _) = bincode::serde::decode_from_slice::<RoaringBitmap, _>(&blob, config)?;
         bitmaps.push(bitmap);
     }
 
