@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bincode::config;
 use roaring::RoaringBitmap;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tracing::{debug, error};
 
 use crate::error::{IndexError, IndexResult};
@@ -151,6 +151,29 @@ impl PersistentIndex {
 
     pub fn search(&self, query: &str) -> IndexResult<Vec<SearchHit>> {
         search_database_file(&self.db_path, query)
+    }
+
+    /// Read a value from the meta table, if present.
+    pub fn get_meta(&self, key: &str) -> IndexResult<Option<String>> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+
+        let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let value: Option<String> = stmt.query_row([key], |row| row.get(0)).optional()?;
+        Ok(value)
+    }
+
+    /// Set a value in the meta table. Used for lightweight bookkeeping like
+    /// storing the last indexed git HEAD.
+    pub fn set_meta(&self, key: &str, value: &str) -> IndexResult<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -486,6 +509,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             file_id INTEGER PRIMARY KEY,
             trigrams BLOB NOT NULL,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
         ",
     )?;
