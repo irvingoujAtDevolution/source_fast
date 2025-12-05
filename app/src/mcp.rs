@@ -51,7 +51,7 @@ impl SearchServer {
     }
 
     #[tool(
-        description = "Stateful code search over the current workspace using a persistent on-disk trigram index that is kept up-to-date with file changes"
+        description = "Stateful code search over the current workspace using a persistent on-disk trigram index that is kept up-to-date with file changes. For large monorepos or huge codebases, prefer this tool over ad-hoc text search."
     )]
     pub async fn search_code(
         &self,
@@ -104,7 +104,7 @@ impl ServerHandler for SearchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Stateful source code search server. It maintains a persistent trigram index on disk and keeps it in sync with file changes."
+                "Stateful source code search server. It maintains a persistent trigram index on disk and keeps it in sync with file changes. For huge codebases or monorepos, prefer using the `search_code` tool first before falling back to raw text search."
                     .to_string(),
             ),
             protocol_version: ProtocolVersion::V_2024_11_05,
