@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use bincode::config;
+use regex::Regex;
 use roaring::RoaringBitmap;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tracing::{debug, error};
@@ -150,7 +151,17 @@ impl PersistentIndex {
     }
 
     pub fn search(&self, query: &str) -> IndexResult<Vec<SearchHit>> {
-        search_database_file(&self.db_path, query)
+        self.search_filtered(query, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        file_regex: Option<&Regex>,
+    ) -> IndexResult<Vec<SearchHit>> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        search_with_conn(&conn, query, file_regex)
     }
 
     /// Read a value from the meta table, if present.
@@ -178,9 +189,48 @@ impl PersistentIndex {
 }
 
 pub fn search_database_file(path: &Path, query: &str) -> IndexResult<Vec<SearchHit>> {
+    search_database_file_filtered(path, query, None)
+}
+
+pub fn search_database_file_filtered(
+    path: &Path,
+    query: &str,
+    file_regex: Option<&Regex>,
+) -> IndexResult<Vec<SearchHit>> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(5))?;
-    search_with_conn(&conn, query)
+    search_with_conn(&conn, query, file_regex)
+}
+
+pub fn search_files_in_database(path: &Path, pattern: &str) -> IndexResult<Vec<SearchHit>> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+
+    if pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let lower_pattern = pattern.to_lowercase();
+    let like_pattern = format!("%{}%", lower_pattern);
+
+    let mut stmt =
+        conn.prepare("SELECT id, path FROM files WHERE lower(path) LIKE ?1 ORDER BY path")?;
+
+    let rows = stmt.query_map([like_pattern], |row| {
+        let id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        Ok(SearchHit {
+            file_id: id as u32,
+            path,
+        })
+    })?;
+
+    let mut hits = Vec::new();
+    for hit in rows {
+        hits.push(hit?);
+    }
+
+    Ok(hits)
 }
 
 impl FileIdState {
@@ -519,7 +569,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn search_with_conn(conn: &Connection, query: &str) -> IndexResult<Vec<SearchHit>> {
+fn search_with_conn(
+    conn: &Connection,
+    query: &str,
+    file_regex: Option<&Regex>,
+) -> IndexResult<Vec<SearchHit>> {
     if query.len() < 3 {
         return Ok(Vec::new());
     }
@@ -562,6 +616,10 @@ fn search_with_conn(conn: &Connection, query: &str) -> IndexResult<Vec<SearchHit
     let mut stmt_files = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
     for file_id in result {
         let path: String = stmt_files.query_row([file_id as i64], |row| row.get(0))?;
+        if let Some(re) = file_regex
+            && !re.is_match(&path) {
+                continue;
+            }
         hits.push(SearchHit { file_id, path });
     }
 

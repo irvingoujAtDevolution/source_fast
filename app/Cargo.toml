@@ -18,3 +18,4 @@ source_fast_core = { path = "../core", package = "core" }
 fs_layer = { path = "../fs", package = "fs" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1.11"

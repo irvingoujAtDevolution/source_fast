@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_layer::smart_scan;
-use source_fast_core::{PersistentIndex, extract_snippet, search_database_file};
+use regex::Regex;
+use source_fast_core::{
+    PersistentIndex, extract_snippet, search_database_file_filtered, search_files_in_database,
+};
 use tracing::{error, info, warn};
 
 pub fn default_root() -> PathBuf {
@@ -80,9 +83,22 @@ pub async fn run_cli(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
     query: String,
+    file_regex: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
+
+    let file_regex = if let Some(pattern) = file_regex {
+        match Regex::new(&pattern) {
+            Ok(re) => Some(re),
+            Err(err) => {
+                error!("Invalid file regex '{}': {}", pattern, err);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     if !db_path.exists() {
         error!(
@@ -92,7 +108,7 @@ pub async fn run_cli(
         std::process::exit(1);
     }
 
-    let hits = match search_database_file(&db_path, &query) {
+    let hits = match search_database_file_filtered(&db_path, &query, file_regex.as_ref()) {
         Ok(h) => h,
         Err(err) => {
             error!("Search failed: {:?}", err);
@@ -117,6 +133,37 @@ pub async fn run_cli(
                 warn!("Failed to extract snippet from {}: {err}", path.display());
             }
         }
+    }
+
+    Ok(())
+}
+
+pub async fn run_file_search(
+    root: Option<PathBuf>,
+    db: Option<PathBuf>,
+    pattern: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = root.unwrap_or_else(default_root);
+    let db_path = db.unwrap_or_else(|| default_db_path(&root));
+
+    if !db_path.exists() {
+        error!(
+            "Index database not found at {}. Run `sf index --root <root>` to build the index.",
+            db_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    let hits = match search_files_in_database(&db_path, &pattern) {
+        Ok(h) => h,
+        Err(err) => {
+            error!("File search failed: {:?}", err);
+            std::process::exit(1);
+        }
+    };
+
+    for hit in hits {
+        println!("{}", hit.path);
     }
 
     Ok(())

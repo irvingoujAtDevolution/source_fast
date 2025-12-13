@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fs_layer::{background_watcher, smart_scan};
+use regex::Regex;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -38,6 +39,8 @@ impl SearchServer {
 #[derive(Deserialize, JsonSchema)]
 pub struct SearchCodeArgs {
     pub query: String,
+    #[serde(default)]
+    pub file_regex: Option<String>,
 }
 
 #[tool_router]
@@ -67,11 +70,21 @@ impl SearchServer {
         let query = args.query.clone();
         let query_for_search = query.clone();
         let index = Arc::clone(&self.index);
+        let file_regex = args
+            .file_regex
+            .as_ref()
+            .map(|pattern| {
+                Regex::new(pattern)
+                    .map_err(|e| Self::internal_error("invalid_file_regex", e.to_string()))
+            })
+            .transpose()?;
 
-        let hits = task::spawn_blocking(move || index.search(&query_for_search))
-            .await
-            .map_err(|e| Self::internal_error("search_task_failed", e.to_string()))?
-            .map_err(|e| Self::internal_error("search_failed", e.to_string()))?;
+        let hits = task::spawn_blocking(move || {
+            index.search_filtered(&query_for_search, file_regex.as_ref())
+        })
+        .await
+        .map_err(|e| Self::internal_error("search_task_failed", e.to_string()))?
+        .map_err(|e| Self::internal_error("search_failed", e.to_string()))?;
 
         let mut contents = Vec::new();
         for hit in hits {

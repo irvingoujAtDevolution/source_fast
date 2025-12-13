@@ -101,6 +101,7 @@ dependencies = [
  "clap",
  "core",
  "fs",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
@@ -301,6 +302,7 @@ name = "core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "regex",
  "roaring",
  "rusqlite",
  "serde",
