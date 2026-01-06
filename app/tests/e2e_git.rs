@@ -112,9 +112,8 @@ fn test_g3_dirty_state_untracked() {
 /// G4: Branch Switch
 /// Create branch, make changes, commit, switch back.
 /// Expected: Index reflects current branch state after each index.
-/// BUG: Currently failing - files from other branches not removed from index.
+/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
-#[ignore = "BUG: Branch switching doesn't remove files - needs fix in smart_scan"]
 fn test_g4_branch_switch() {
     let fix = TestFixture::new();
     fix.git_init();
@@ -163,9 +162,8 @@ fn test_g4_branch_switch() {
 /// G5: Git Reset
 /// Do git reset --hard HEAD~1 to remove recent work.
 /// Expected: Deleted files disappear from search results.
-/// BUG: Currently failing - reset files not removed from index.
+/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
-#[ignore = "BUG: Git reset doesn't remove files - needs fix in smart_scan"]
 fn test_g5_git_reset() {
     let fix = TestFixture::new();
     fix.git_init();

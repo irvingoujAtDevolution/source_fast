@@ -11,9 +11,8 @@ use predicates::prelude::*;
 /// Delete a file and re-index.
 /// Expected: Search for unique string in deleted file returns 0 results.
 /// Note: Deletion tracking requires git - the tool is designed for git repos.
-/// BUG: Currently failing - deleted files are not removed from the index.
+/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
-#[ignore = "BUG: Deleted files not removed from index - needs fix in smart_scan"]
 fn test_f1_deletion() {
     let fix = TestFixture::new();
     fix.git_init();
@@ -53,9 +52,8 @@ fn test_f1_deletion() {
 /// Rename a file and re-index.
 /// Expected: Search returns new name, not old name.
 /// Note: Rename tracking requires git - the tool is designed for git repos.
-/// BUG: Currently failing - renamed (deleted) files not removed from index.
+/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
-#[ignore = "BUG: Renamed files not properly tracked - needs fix in smart_scan"]
 fn test_f2_rename() {
     let fix = TestFixture::new();
     fix.git_init();

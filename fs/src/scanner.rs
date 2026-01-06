@@ -217,14 +217,33 @@ fn collect_head_diff_candidates(
                 let abs = workdir.join(rel_str);
                 paths.push(abs);
             }
-            ChangeDetached::Modification { location, .. }
-            | ChangeDetached::Rewrite { location, .. } => {
+            ChangeDetached::Modification { location, .. } => {
                 let rel = location.as_bstr();
                 let rel_str = std::str::from_utf8(rel.as_bytes()).map_err(|e| {
                     IndexError::Encode(format!("non-utf8 path in modification {rel:?}: {e}"))
                 })?;
                 let abs = workdir.join(rel_str);
                 paths.push(abs);
+            }
+            ChangeDetached::Rewrite {
+                source_location,
+                location,
+                ..
+            } => {
+                // For renames/rewrites, we need BOTH paths:
+                // - source_location (old path) to remove from index
+                // - location (new path) to add to index
+                let old_rel = source_location.as_bstr();
+                let old_rel_str = std::str::from_utf8(old_rel.as_bytes()).map_err(|e| {
+                    IndexError::Encode(format!("non-utf8 path in rewrite source {old_rel:?}: {e}"))
+                })?;
+                paths.push(workdir.join(old_rel_str));
+
+                let new_rel = location.as_bstr();
+                let new_rel_str = std::str::from_utf8(new_rel.as_bytes()).map_err(|e| {
+                    IndexError::Encode(format!("non-utf8 path in rewrite dest {new_rel:?}: {e}"))
+                })?;
+                paths.push(workdir.join(new_rel_str));
             }
             ChangeDetached::Deletion { location, .. } => {
                 let rel = location.as_bstr();

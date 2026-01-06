@@ -56,10 +56,25 @@ pub fn file_modified_timestamp(path: &Path) -> u64 {
 }
 
 pub fn normalize_path(path: &Path) -> String {
-    match path.canonicalize() {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => path.to_string_lossy().into_owned(),
+    // Try direct canonicalization first (file exists)
+    if let Ok(p) = path.canonicalize() {
+        return p.to_string_lossy().into_owned();
     }
+
+    // File doesn't exist - canonicalize parent and append filename
+    if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Some(file_name) = path.file_name() {
+                return canonical_parent
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+    }
+
+    // Ultimate fallback
+    path.to_string_lossy().into_owned()
 }
 
 pub fn extract_snippet(path: &Path, query: &str) -> std::io::Result<Option<Snippet>> {
