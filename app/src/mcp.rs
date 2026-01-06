@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fs_layer::{background_watcher, smart_scan};
+use source_fast_fs::{background_watcher, smart_scan};
 use regex::Regex;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,

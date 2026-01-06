@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fs_layer::smart_scan;
+use source_fast_fs::smart_scan;
 use regex::Regex;
 use source_fast_core::{
     PersistentIndex, extract_snippet, search_database_file_filtered, search_files_in_database,

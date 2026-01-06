@@ -1,7 +1,12 @@
 [package]
-name = "app"
+name = "source_fast"
 version = "0.1.0"
 edition = "2024"
+description = "Fast, persistent trigram-based code search with MCP server support"
+license = "MIT"
+repository = "https://github.com/user/source_fast"
+keywords = ["search", "trigram", "code", "mcp", "cli"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
 name = "sf"
@@ -14,8 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rmcp = { version = "0.10", features = ["server", "transport-io", "macros"] }
 schemars = "1.1"
-source_fast_core = { path = "../core", package = "core" }
-fs_layer = { path = "../fs", package = "fs" }
+source_fast_core = { path = "../core" }
+source_fast_fs = { path = "../fs" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.11"

@@ -95,27 +95,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "assert_cmd",
- "assert_fs",
- "clap",
- "core",
- "fs",
- "insta",
- "predicates",
- "regex",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,20 +320,6 @@ dependencies = [
  "libc",
  "once_cell",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "regex",
- "roaring",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -604,19 +569,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs"
-version = "0.1.0"
-dependencies = [
- "core",
- "gix",
- "ignore",
- "notify",
- "rayon",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2643,6 +2595,54 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "source_fast"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "assert_fs",
+ "clap",
+ "insta",
+ "predicates",
+ "regex",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "source_fast_core",
+ "source_fast_fs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "source_fast_core"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "regex",
+ "roaring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "source_fast_fs"
+version = "0.1.0"
+dependencies = [
+ "gix",
+ "ignore",
+ "notify",
+ "rayon",
+ "source_fast_core",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "stable_deref_trait"

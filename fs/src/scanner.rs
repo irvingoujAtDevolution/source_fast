@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -120,41 +119,91 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
 }
 
 fn collect_worktree_candidates(
-    _repo: &Repository,
+    repo: &Repository,
     workdir: &Path,
 ) -> Result<Vec<PathBuf>, IndexError> {
+    use gix::status::index_worktree::iter::Item;
+
     let mut paths = Vec::new();
 
-    match Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(workdir)
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.len() <= 3 {
-                    continue;
-                }
-                // Porcelain v1: two status chars + space, then the path.
-                let path_str = &line[3..];
-                let trimmed = path_str.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                paths.push(workdir.join(trimmed));
-            }
-        }
-        Ok(output) => {
-            warn!(
-                "collect_worktree_candidates: git status --porcelain exited with status {} – treating as no worktree candidates",
-                output.status
-            );
-        }
+    // Use gix's status API to find modified/untracked files
+    let status = match repo.status(gix::progress::Discard) {
+        Ok(s) => s,
         Err(err) => {
             warn!(
-                "collect_worktree_candidates: failed to run git status --porcelain: {err} – treating as no worktree candidates"
+                "collect_worktree_candidates: failed to get status: {err} – treating as no worktree candidates"
             );
+            return Ok(paths);
+        }
+    };
+
+    let platform = match status.into_index_worktree_iter(Vec::new()) {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(
+                "collect_worktree_candidates: failed to create status iterator: {err} – treating as no worktree candidates"
+            );
+            return Ok(paths);
+        }
+    };
+
+    for item in platform {
+        let item = match item {
+            Ok(i) => i,
+            Err(err) => {
+                warn!("collect_worktree_candidates: error iterating status: {err}");
+                continue;
+            }
+        };
+
+        // Get the path from the status item based on its variant
+        match &item {
+            Item::Modification { rela_path, .. } => {
+                let rel_str = match std::str::from_utf8(rela_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("collect_worktree_candidates: non-utf8 path: {err}");
+                        continue;
+                    }
+                };
+                paths.push(workdir.join(rel_str));
+            }
+            Item::DirectoryContents { entry, .. } => {
+                let rel_str = match std::str::from_utf8(entry.rela_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("collect_worktree_candidates: non-utf8 path: {err}");
+                        continue;
+                    }
+                };
+                paths.push(workdir.join(rel_str));
+            }
+            Item::Rewrite {
+                source,
+                dirwalk_entry,
+                ..
+            } => {
+                // Add the source (old) path
+                let source_path = source.rela_path();
+                let source_str = match std::str::from_utf8(source_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("collect_worktree_candidates: non-utf8 source path: {err}");
+                        continue;
+                    }
+                };
+                paths.push(workdir.join(source_str));
+
+                // Add the destination (new) path
+                let dest_str = match std::str::from_utf8(dirwalk_entry.rela_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("collect_worktree_candidates: non-utf8 dest path: {err}");
+                        continue;
+                    }
+                };
+                paths.push(workdir.join(dest_str));
+            }
         }
     }
 
@@ -266,32 +315,15 @@ fn initial_git_scan(
     current_head: &str,
 ) -> Result<(), IndexError> {
     info!(
-        "initial_git_scan: starting ls-files/status based scan at {}",
+        "initial_git_scan: starting gix-based scan at {}",
         workdir.display()
     );
 
-    let mut candidates: HashSet<PathBuf> = HashSet::new();
-
-    // 1. Tracked files: equivalent to `git ls-files`.
-    match Command::new("git")
-        .arg("ls-files")
-        .current_dir(workdir)
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                candidates.insert(workdir.join(trimmed));
-            }
-        }
-        Ok(output) => {
+    let repo = match gix::discover(workdir) {
+        Ok(r) => r,
+        Err(err) => {
             warn!(
-                "initial_git_scan: git ls-files exited with status {} – falling back to full walk",
-                output.status
+                "initial_git_scan: failed to open repository: {err} – falling back to full walk"
             );
             initial_scan(root, Arc::clone(&index))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
@@ -301,9 +333,32 @@ fn initial_git_scan(
             }
             return Ok(());
         }
+    };
+
+    let mut candidates: HashSet<PathBuf> = HashSet::new();
+
+    // 1. Tracked files: equivalent to `git ls-files` using gix index
+    match repo.index() {
+        Ok(git_index) => {
+            for entry in git_index.entries() {
+                let rel_path = entry.path(&git_index);
+                let rel_str = match std::str::from_utf8(rel_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("initial_git_scan: non-utf8 path in index: {err}");
+                        continue;
+                    }
+                };
+                candidates.insert(workdir.join(rel_str));
+            }
+            info!(
+                "initial_git_scan: found {} tracked files from index",
+                candidates.len()
+            );
+        }
         Err(err) => {
             warn!(
-                "initial_git_scan: failed to run git ls-files: {err} – falling back to full walk"
+                "initial_git_scan: failed to read git index: {err} – falling back to full walk"
             );
             initial_scan(root, Arc::clone(&index))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
@@ -315,36 +370,21 @@ fn initial_git_scan(
         }
     }
 
-    // 2. Dirty / untracked state: `git status --porcelain`.
-    match Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(workdir)
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.len() <= 3 {
-                    continue;
-                }
-                // Porcelain v1: two status chars + space, then the path.
-                let path_str = &line[3..];
-                let trimmed = path_str.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                candidates.insert(workdir.join(trimmed));
+    // 2. Dirty / untracked state using gix status
+    match collect_worktree_candidates(&repo, workdir) {
+        Ok(dirty_paths) => {
+            let dirty_count = dirty_paths.len();
+            candidates.extend(dirty_paths);
+            if dirty_count > 0 {
+                info!(
+                    "initial_git_scan: found {} dirty/untracked files",
+                    dirty_count
+                );
             }
-        }
-        Ok(output) => {
-            warn!(
-                "initial_git_scan: git status --porcelain exited with status {} – continuing without dirty-state candidates",
-                output.status
-            );
         }
         Err(err) => {
             warn!(
-                "initial_git_scan: failed to run git status --porcelain: {err} – continuing without dirty-state candidates"
+                "initial_git_scan: failed to collect worktree candidates: {err} – continuing without dirty-state candidates"
             );
         }
     }

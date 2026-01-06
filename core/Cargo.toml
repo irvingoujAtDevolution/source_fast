@@ -1,7 +1,12 @@
 [package]
-name = "core"
+name = "source_fast_core"
 version = "0.1.0"
 edition = "2024"
+description = "Core indexing and search engine for source_fast"
+license = "MIT"
+repository = "https://github.com/user/source_fast"
+keywords = ["search", "trigram", "code", "index"]
+categories = ["development-tools", "text-processing"]
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }

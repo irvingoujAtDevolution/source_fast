@@ -1,13 +1,18 @@
 [package]
-name = "fs"
+name = "source_fast_fs"
 version = "0.1.0"
 edition = "2024"
+description = "Filesystem scanning and git integration for source_fast"
+license = "MIT"
+repository = "https://github.com/user/source_fast"
+keywords = ["search", "filesystem", "git", "watcher"]
+categories = ["development-tools", "filesystem"]
 
 [dependencies]
 ignore = "0.4"
 notify = "8.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
-source_fast_core = { path = "../core", package = "core" }
+source_fast_core = { path = "../core" }
 tracing = "0.1"
 rayon = "1.10"
 gix = "0.69"

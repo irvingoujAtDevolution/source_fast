@@ -5,7 +5,6 @@
 mod common;
 
 use common::TestFixture;
-use predicates::prelude::*;
 
 /// F1: Deletion
 /// Delete a file and re-index.

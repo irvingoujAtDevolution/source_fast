@@ -2,6 +2,9 @@
 //!
 //! Provides `TestFixture` for easy test setup with file and git operations.
 
+#![allow(dead_code)] // Test helpers may not be used in all test modules
+#![allow(deprecated)] // cargo_bin() deprecation - the new API requires more investigation
+
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;

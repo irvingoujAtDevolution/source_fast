@@ -154,23 +154,20 @@ The search output includes tracing logs with ANSI color codes:
 
 When checking output, be aware these codes are present. Use `contains()` rather than exact matching.
 
-## Known Bugs (Documented via Ignored Tests)
+## Previously Known Bugs (Now Fixed)
 
-The following tests are `#[ignore]` because they reveal real bugs:
+The following tests were previously `#[ignore]` but are now enabled after fixes in commit `6b11557`:
 
-| Test | Bug |
-|------|-----|
-| `test_f1_deletion` | Deleted files not removed from index |
-| `test_f2_rename` | Renamed files leave ghost entries |
-| `test_g4_branch_switch` | Branch files not cleaned up |
-| `test_g5_git_reset` | Reset files remain indexed |
+| Test | Bug | Fix |
+|------|-----|-----|
+| `test_f1_deletion` | Deleted files not removed from index | `normalize_path()` now handles deleted files by canonicalizing parent directory |
+| `test_f2_rename` | Renamed files leave ghost entries | Scanner now adds both source and destination paths for Rewrite changes |
+| `test_g4_branch_switch` | Branch files not cleaned up | Same fix as above |
+| `test_g5_git_reset` | Reset files remain indexed | Same fix as above |
 
-**Root Cause:** `smart_scan()` in `fs/src/scanner.rs` doesn't call `index.remove_path()` for deleted files.
-
-**To run ignored tests:**
-```bash
-cargo test --package app -- --ignored
-```
+**Root Cause (Fixed):** Two issues were causing deleted files to remain in the index:
+1. `normalize_path()` in `core/src/text.rs` used `path.canonicalize()` which fails for deleted files
+2. Git rename operations (Rewrite changes) only added the new path, missing the old path
 
 ## Running Tests
 
