@@ -525,3 +525,379 @@ pub fn initial_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), Inde
     info!("initial_scan: completed, indexed {} files in total", done);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn create_test_index(dir: &Path) -> Arc<PersistentIndex> {
+        let db_path = dir.join(".source_fast").join("index.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        Arc::new(PersistentIndex::open_or_create(&db_path).unwrap())
+    }
+
+    fn init_git_repo(dir: &Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init failed");
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .expect("git config email failed");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .expect("git config name failed");
+    }
+
+    fn git_add_commit(dir: &Path, msg: &str) {
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .expect("git add failed");
+        Command::new("git")
+            .args(["commit", "-m", msg, "--allow-empty"])
+            .current_dir(dir)
+            .output()
+            .expect("git commit failed");
+    }
+
+    // ============ Initial Scan Tests ============
+
+    #[test]
+    fn test_initial_scan_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = create_test_index(temp_dir.path());
+
+        let result = initial_scan(temp_dir.path(), index);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_initial_scan_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create some files
+        std::fs::write(temp_dir.path().join("file1.txt"), "content one").unwrap();
+        std::fs::write(temp_dir.path().join("file2.txt"), "content two").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        initial_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Verify files were indexed
+        let hits = index.search("content one").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let hits = index.search("content two").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_initial_scan_skips_source_fast_dir() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a file that should be indexed
+        std::fs::write(temp_dir.path().join("normal.txt"), "normal_content").unwrap();
+
+        // Create the .source_fast directory with a file that should NOT be indexed
+        let sf_dir = temp_dir.path().join(".source_fast");
+        std::fs::create_dir_all(&sf_dir).unwrap();
+        std::fs::write(sf_dir.join("internal.txt"), "internal_content").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        initial_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Normal file should be indexed
+        let hits = index.search("normal_content").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Internal file should NOT be indexed
+        let hits = index.search("internal_content").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_initial_scan_skips_git_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Create a normal file
+        std::fs::write(temp_dir.path().join("normal.txt"), "normal_content").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        initial_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Normal file should be indexed
+        let hits = index.search("normal_content").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // .git directory contents should NOT be indexed
+        // (We don't search for git internal content since we don't know what's there)
+    }
+
+    #[test]
+    fn test_initial_scan_respects_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Create .gitignore
+        std::fs::write(temp_dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+
+        // Create files
+        std::fs::write(temp_dir.path().join("tracked.txt"), "tracked_content").unwrap();
+        std::fs::write(temp_dir.path().join("ignored.txt"), "ignored_content").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        initial_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Tracked file should be indexed
+        let hits = index.search("tracked_content").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Ignored file should NOT be indexed
+        let hits = index.search("ignored_content").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_initial_scan_nested_directories() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create nested structure
+        let nested = temp_dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.txt"), "deep_content").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        initial_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Nested file should be indexed
+        let hits = index.search("deep_content").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    // ============ Smart Scan Tests ============
+
+    #[test]
+    fn test_smart_scan_no_git_falls_back() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a file (no git repo)
+        std::fs::write(temp_dir.path().join("file.txt"), "file_content").unwrap();
+
+        let index = create_test_index(temp_dir.path());
+        let result = smart_scan(temp_dir.path(), index);
+
+        // Should fall back to initial_scan and succeed
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_smart_scan_first_run_stores_head() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Create and commit a file
+        std::fs::write(temp_dir.path().join("file.txt"), "file_content").unwrap();
+        git_add_commit(temp_dir.path(), "Initial commit");
+
+        let index = create_test_index(temp_dir.path());
+
+        // First run - should store git_head
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        let stored_head = index.get_meta("git_head").unwrap();
+        assert!(stored_head.is_some(), "git_head should be stored after first run");
+    }
+
+    #[test]
+    fn test_smart_scan_no_changes_is_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Create and commit a file
+        std::fs::write(temp_dir.path().join("file.txt"), "file_content").unwrap();
+        git_add_commit(temp_dir.path(), "Initial commit");
+
+        let index = create_test_index(temp_dir.path());
+
+        // First scan
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Second scan with no changes - should complete quickly
+        let result = smart_scan(temp_dir.path(), Arc::clone(&index));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_smart_scan_detects_new_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Initial file and commit
+        std::fs::write(temp_dir.path().join("file1.txt"), "content_one").unwrap();
+        git_add_commit(temp_dir.path(), "First commit");
+
+        let index = create_test_index(temp_dir.path());
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Verify first file is indexed
+        let hits = index.search("content_one").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Add new file and commit
+        std::fs::write(temp_dir.path().join("file2.txt"), "content_two_unique").unwrap();
+        git_add_commit(temp_dir.path(), "Second commit");
+
+        // Smart scan should pick up the new file
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        let hits = index.search("content_two_unique").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_smart_scan_detects_dirty_state() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Initial commit
+        std::fs::write(temp_dir.path().join("file.txt"), "original").unwrap();
+        git_add_commit(temp_dir.path(), "Initial commit");
+
+        let index = create_test_index(temp_dir.path());
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Modify file without committing
+        std::fs::write(temp_dir.path().join("file.txt"), "modified_content_xyz").unwrap();
+
+        // Smart scan should pick up the modification
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        let hits = index.search("modified_content_xyz").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_smart_scan_detects_untracked_files() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+
+        // Initial commit
+        std::fs::write(temp_dir.path().join("tracked.txt"), "tracked").unwrap();
+        git_add_commit(temp_dir.path(), "Initial commit");
+
+        let index = create_test_index(temp_dir.path());
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        // Add untracked file (not committed)
+        std::fs::write(temp_dir.path().join("untracked.txt"), "untracked_content_xyz").unwrap();
+
+        // Smart scan should pick up untracked files
+        smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
+
+        let hits = index.search("untracked_content_xyz").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    // ============ Apply Changes Tests ============
+
+    #[test]
+    fn test_apply_changes_adds_new_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = create_test_index(temp_dir.path());
+
+        // Create a file
+        let file_path = temp_dir.path().join("new_file.txt");
+        std::fs::write(&file_path, "new_file_content").unwrap();
+
+        // Apply changes for this file
+        apply_changes_by_files(temp_dir.path(), &index, vec![file_path]).unwrap();
+
+        let hits = index.search("new_file_content").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_changes_removes_deleted_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = create_test_index(temp_dir.path());
+
+        // Create and index a file
+        let file_path = temp_dir.path().join("to_delete.txt");
+        std::fs::write(&file_path, "delete_me_content").unwrap();
+        index.index_path(&file_path).unwrap();
+        index.flush().unwrap();
+
+        // Verify it's indexed
+        let hits = index.search("delete_me_content").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Delete the file
+        std::fs::remove_file(&file_path).unwrap();
+
+        // Apply changes - should remove from index
+        apply_changes_by_files(temp_dir.path(), &index, vec![file_path]).unwrap();
+
+        let hits = index.search("delete_me_content").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_apply_changes_skips_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = create_test_index(temp_dir.path());
+
+        // Create a directory (not a file)
+        let dir_path = temp_dir.path().join("some_dir");
+        std::fs::create_dir(&dir_path).unwrap();
+
+        // Apply changes - should not error even though it's a directory
+        let result = apply_changes_by_files(temp_dir.path(), &index, vec![dir_path]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_changes_skips_files_outside_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+
+        let index = create_test_index(temp_dir.path());
+
+        // Create a file outside the root
+        let outside_file = other_dir.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside_content").unwrap();
+
+        // Apply changes - should skip this file
+        apply_changes_by_files(temp_dir.path(), &index, vec![outside_file]).unwrap();
+
+        // File should NOT be indexed (it's outside the root)
+        let hits = index.search("outside_content").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_apply_changes_skips_source_fast_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = create_test_index(temp_dir.path());
+
+        // Create a file inside .source_fast
+        let sf_file = temp_dir.path().join(".source_fast").join("internal.txt");
+        std::fs::create_dir_all(sf_file.parent().unwrap()).unwrap();
+        std::fs::write(&sf_file, "internal_content").unwrap();
+
+        // Apply changes - should skip this file
+        apply_changes_by_files(temp_dir.path(), &index, vec![sf_file]).unwrap();
+
+        // File should NOT be indexed
+        let hits = index.search("internal_content").unwrap();
+        assert!(hits.is_empty());
+    }
+}

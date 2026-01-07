@@ -256,15 +256,20 @@ fn test_large_file() {
 }
 
 /// Additional: Rapid file changes
+/// Uses git to track changes properly since filesystem timestamps
+/// may not have enough resolution for rapid changes.
 #[test]
 fn test_rapid_changes() {
     let fix = TestFixture::new();
-    fix.add_file("src/main.rs", "fn initial() {}");
+    fix.git_init();
+    fix.add_file("main.rs", "fn initial() {}");
+    fix.git_commit("initial");
     fix.index();
 
-    // Rapid changes
+    // Rapid changes with git commits
     for i in 0..5 {
-        fix.add_file("src/main.rs", &format!("fn rapid_change_{}() {{}}", i));
+        fix.add_file("main.rs", &format!("fn rapid_change_{}() {{}}", i));
+        fix.git_commit(&format!("change {}", i));
         fix.index();
     }
 

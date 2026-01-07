@@ -625,3 +625,351 @@ fn search_with_conn(
 
     Ok(hits)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn create_test_index() -> (TempDir, PersistentIndex) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+        (temp_dir, index)
+    }
+
+    // ============ PersistentIndex Basic Tests ============
+
+    #[test]
+    fn test_create_new_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("new_index.db");
+
+        let index = PersistentIndex::open_or_create(&db_path);
+        assert!(index.is_ok());
+        assert!(db_path.exists());
+    }
+
+    #[test]
+    fn test_reopen_existing_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("existing_index.db");
+
+        // Create and drop
+        {
+            let _index = PersistentIndex::open_or_create(&db_path).unwrap();
+        }
+
+        // Reopen - should succeed
+        let index = PersistentIndex::open_or_create(&db_path);
+        assert!(index.is_ok());
+    }
+
+    #[test]
+    fn test_index_and_search_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create a test file
+        let test_file = temp_dir.path().join("test.rs");
+        let mut f = std::fs::File::create(&test_file).unwrap();
+        writeln!(f, "fn hello_world() {{").unwrap();
+        writeln!(f, "    println!(\"Hello, World!\");").unwrap();
+        writeln!(f, "}}").unwrap();
+        f.flush().unwrap();
+
+        // Index the file
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Search for content
+        let hits = index.search("hello_world").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("test.rs"));
+    }
+
+    #[test]
+    fn test_search_query_too_short() {
+        let (_temp_dir, index) = create_test_index();
+
+        // Queries < 3 chars should return empty
+        let hits = index.search("").unwrap();
+        assert!(hits.is_empty());
+
+        let hits = index.search("ab").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_search_no_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create and index a file
+        let test_file = temp_dir.path().join("test.txt");
+        std::fs::write(&test_file, "hello world").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Search for non-existent content
+        let hits = index.search("nonexistent_string_xyz").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_remove_file_from_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create and index a file
+        let test_file = temp_dir.path().join("removeme.txt");
+        std::fs::write(&test_file, "unique_content_for_removal").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Verify it's searchable
+        let hits = index.search("unique_content_for_removal").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Remove from index
+        index.remove_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Should no longer be found
+        let hits = index.search("unique_content_for_removal").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_update_file_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        let test_file = temp_dir.path().join("update.txt");
+
+        // Initial content
+        std::fs::write(&test_file, "original_content_abc").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        let hits = index.search("original_content").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Update content - need to wait for mtime to change.
+        // Windows NTFS has ~2 second timestamp resolution, so we need to wait longer.
+        #[cfg(windows)]
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        #[cfg(not(windows))]
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        std::fs::write(&test_file, "updated_content_xyz").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // New content should be searchable
+        let hits = index.search("updated_content").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    // ============ Meta Table Tests ============
+
+    #[test]
+    fn test_meta_get_set() {
+        let (_temp_dir, index) = create_test_index();
+
+        // Initially empty
+        let val = index.get_meta("test_key").unwrap();
+        assert!(val.is_none());
+
+        // Set a value
+        index.set_meta("test_key", "test_value").unwrap();
+
+        // Should be retrievable
+        let val = index.get_meta("test_key").unwrap();
+        assert_eq!(val, Some("test_value".to_string()));
+    }
+
+    #[test]
+    fn test_meta_update() {
+        let (_temp_dir, index) = create_test_index();
+
+        index.set_meta("key", "value1").unwrap();
+        index.set_meta("key", "value2").unwrap();
+
+        let val = index.get_meta("key").unwrap();
+        assert_eq!(val, Some("value2".to_string()));
+    }
+
+    // ============ Search with File Filter Tests ============
+
+    #[test]
+    fn test_search_with_file_filter() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create multiple files with same content
+        let rs_file = temp_dir.path().join("code.rs");
+        let txt_file = temp_dir.path().join("notes.txt");
+
+        std::fs::write(&rs_file, "shared_content_abc").unwrap();
+        std::fs::write(&txt_file, "shared_content_abc").unwrap();
+
+        index.index_path(&rs_file).unwrap();
+        index.index_path(&txt_file).unwrap();
+        index.flush().unwrap();
+
+        // Without filter - both files
+        let hits = index.search("shared_content").unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // With filter - only .rs files
+        let re = Regex::new(r"\.rs$").unwrap();
+        let hits = index.search_filtered("shared_content", Some(&re)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with(".rs"));
+    }
+
+    // ============ File Path Search Tests ============
+
+    #[test]
+    fn test_search_files_by_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create files in subdirectories
+        let src_dir = temp_dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let main_rs = src_dir.join("main.rs");
+        let lib_rs = src_dir.join("lib.rs");
+        let readme = temp_dir.path().join("README.md");
+
+        std::fs::write(&main_rs, "fn main() {}").unwrap();
+        std::fs::write(&lib_rs, "pub mod test;").unwrap();
+        std::fs::write(&readme, "# Project").unwrap();
+
+        index.index_path(&main_rs).unwrap();
+        index.index_path(&lib_rs).unwrap();
+        index.index_path(&readme).unwrap();
+        index.flush().unwrap();
+
+        // Search by filename pattern
+        let hits = search_files_in_database(&db_path, "main").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("main.rs"));
+
+        // Search by extension
+        let hits = search_files_in_database(&db_path, ".rs").unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn test_search_files_empty_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let _index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        let hits = search_files_in_database(&db_path, "").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_search_files_case_insensitive() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        let test_file = temp_dir.path().join("MyFile.TXT");
+        std::fs::write(&test_file, "content").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Should match regardless of case
+        let hits = search_files_in_database(&db_path, "myfile").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let hits = search_files_in_database(&db_path, "MYFILE").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    // ============ Binary File Handling Tests ============
+
+    #[test]
+    fn test_binary_file_skipped() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create a binary file
+        let binary_file = temp_dir.path().join("binary.bin");
+        std::fs::write(&binary_file, b"hello\x00world").unwrap();
+
+        // Should not error
+        index.index_path(&binary_file).unwrap();
+        index.flush().unwrap();
+
+        // Binary content should not be searchable
+        let hits = index.search("hello").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    // ============ Multiple Files Tests ============
+
+    #[test]
+    fn test_index_multiple_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Create multiple files
+        for i in 0..10 {
+            let file = temp_dir.path().join(format!("file{}.txt", i));
+            std::fs::write(&file, format!("content_{}_unique", i)).unwrap();
+            index.index_path(&file).unwrap();
+        }
+        index.flush().unwrap();
+
+        // Each should be findable
+        for i in 0..10 {
+            let hits = index.search(&format!("content_{}_unique", i)).unwrap();
+            assert_eq!(hits.len(), 1, "File {} should be found", i);
+        }
+    }
+
+    // ============ Concurrent Access Tests ============
+
+    #[test]
+    fn test_concurrent_search() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        // Index a file
+        let test_file = temp_dir.path().join("concurrent.txt");
+        std::fs::write(&test_file, "concurrent_test_content").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        // Multiple concurrent searches
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    let result = search_database_file(&path, "concurrent_test");
+                    result.is_ok() && result.unwrap().len() == 1
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert!(handle.join().unwrap(), "Concurrent search should succeed");
+        }
+    }
+}
