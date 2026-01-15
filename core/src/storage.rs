@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +46,7 @@ struct IndexJob {
 pub struct PersistentIndex {
     db_path: PathBuf,
     sender: mpsc::Sender<IndexJob>,
+    write_enabled: Arc<AtomicBool>,
 }
 
 impl PersistentIndex {
@@ -79,15 +82,29 @@ impl PersistentIndex {
         let storage = SqliteStorage { conn, ids };
 
         let (tx, rx) = mpsc::channel::<IndexJob>();
-        thread::spawn(move || writer_loop(storage, rx));
+        let write_enabled = Arc::new(AtomicBool::new(true));
+        let write_enabled_for_thread = Arc::clone(&write_enabled);
+        thread::spawn(move || writer_loop(storage, rx, write_enabled_for_thread));
 
         Ok(Self {
             db_path: path.to_path_buf(),
             sender: tx,
+            write_enabled,
         })
     }
 
+    pub fn set_write_enabled(&self, enabled: bool) {
+        self.write_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn write_enabled(&self) -> bool {
+        self.write_enabled.load(Ordering::SeqCst)
+    }
+
     pub fn index_path(&self, path: &Path) -> IndexResult<()> {
+        if !self.write_enabled() {
+            return Ok(());
+        }
         let normalized = normalize_path(path);
 
         let content = match read_text_file(path)? {
@@ -116,6 +133,9 @@ impl PersistentIndex {
     }
 
     pub fn remove_path(&self, path: &Path) -> IndexResult<()> {
+        if !self.write_enabled() {
+            return Ok(());
+        }
         let normalized = normalize_path(path);
 
         let (resp_tx, _resp_rx) = mpsc::channel();
@@ -132,6 +152,9 @@ impl PersistentIndex {
     }
 
     pub fn flush(&self) -> IndexResult<()> {
+        if !self.write_enabled() {
+            return Ok(());
+        }
         let (resp_tx, resp_rx) = mpsc::channel();
         let job = IndexJob {
             payload: IndexPayload::Flush,
@@ -185,6 +208,46 @@ impl PersistentIndex {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn try_acquire_writer_lease(&self, holder: &str, ttl: Duration) -> IndexResult<bool> {
+        let mut conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+
+        let now = now_millis();
+        let expires_at = now.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64);
+
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO leader (name, holder, expires_at_ms) VALUES ('writer', '', 0)",
+            [],
+        )?;
+        let changed = tx.execute(
+            "UPDATE leader
+             SET holder = ?1, expires_at_ms = ?2
+             WHERE name = 'writer' AND (expires_at_ms < ?3 OR holder = ?1)",
+            params![holder, expires_at, now],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn renew_writer_lease(&self, holder: &str, ttl: Duration) -> IndexResult<bool> {
+        let mut conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+
+        let now = now_millis();
+        let expires_at = now.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64);
+
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE leader
+             SET expires_at_ms = ?2
+             WHERE name = 'writer' AND holder = ?1",
+            params![holder, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 }
 
@@ -480,7 +543,11 @@ fn remove_file<'conn>(
     Ok(())
 }
 
-fn writer_loop(mut storage: SqliteStorage, rx: mpsc::Receiver<IndexJob>) {
+fn writer_loop(
+    mut storage: SqliteStorage,
+    rx: mpsc::Receiver<IndexJob>,
+    write_enabled: Arc<AtomicBool>,
+) {
     loop {
         let first = match rx.recv() {
             Ok(job) => job,
@@ -505,12 +572,19 @@ fn writer_loop(mut storage: SqliteStorage, rx: mpsc::Receiver<IndexJob>) {
         }
 
         debug!("writer_loop: processing batch of {} jobs", batch.len());
-        process_batch(&mut storage, batch);
+        process_batch(&mut storage, batch, &write_enabled);
     }
 }
 
-fn process_batch(storage: &mut SqliteStorage, batch: Vec<IndexJob>) {
+fn process_batch(storage: &mut SqliteStorage, batch: Vec<IndexJob>, write_enabled: &AtomicBool) {
     use IndexPayload::*;
+
+    if !write_enabled.load(Ordering::SeqCst) {
+        for job in batch {
+            let _ = job.resp.send(Ok(()));
+        }
+        return;
+    }
 
     let tx = match storage.conn.transaction() {
         Ok(tx) => tx,
@@ -616,9 +690,23 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS leader (
+            name TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL
+        );
         ",
     )?;
     Ok(())
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn search_with_conn(
