@@ -233,6 +233,58 @@ pub fn search_files_in_database(path: &Path, pattern: &str) -> IndexResult<Vec<S
     Ok(hits)
 }
 
+fn ensure_trailing_separator(path: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    if path.ends_with(sep) {
+        path.to_string()
+    } else {
+        format!("{path}{sep}")
+    }
+}
+
+pub fn rewrite_root_paths(
+    db_path: &Path,
+    old_root: &Path,
+    new_root: &Path,
+) -> IndexResult<()> {
+    let old_norm = normalize_path(old_root);
+    let new_norm = normalize_path(new_root);
+    let old_prefix = ensure_trailing_separator(&old_norm);
+    let new_prefix = ensure_trailing_separator(&new_norm);
+
+    if old_prefix == new_prefix {
+        return Ok(());
+    }
+
+    let mut conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare("SELECT id, path FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((id, path))
+        })?;
+
+        for row in rows {
+            let (id, path) = row?;
+            if path.starts_with(&old_prefix) {
+                let suffix = &path[old_prefix.len()..];
+                let new_path = format!("{new_prefix}{suffix}");
+                tx.execute(
+                    "UPDATE files SET path = ?1 WHERE id = ?2",
+                    params![new_path, id],
+                )?;
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
 impl FileIdState {
     fn get_or_create_file_id(&mut self, path: &str) -> u32 {
         if let Some(&id) = self.file_ids.get(path) {

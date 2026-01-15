@@ -4,7 +4,8 @@ use std::sync::Arc;
 use source_fast_fs::smart_scan;
 use regex::Regex;
 use source_fast_core::{
-    PersistentIndex, extract_snippet, search_database_file_filtered, search_files_in_database,
+    IndexError, PersistentIndex, extract_snippet, rewrite_root_paths,
+    search_database_file_filtered, search_files_in_database,
 };
 use tracing::{error, info, warn};
 
@@ -18,6 +19,132 @@ pub fn default_db_path(root: &Path) -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     dir.push("index.db");
     dir
+}
+
+fn remove_db_files(db_path: &Path) {
+    let wal = db_path.with_extension("db-wal");
+    let shm = db_path.with_extension("db-shm");
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(wal);
+    let _ = std::fs::remove_file(shm);
+}
+
+fn is_corrupt_db(err: &IndexError) -> bool {
+    match err {
+        IndexError::Db(db_err) => db_err.to_string().contains("file is not a database"),
+        _ => false,
+    }
+}
+
+fn primary_worktree_root(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .current_dir(root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    None
+}
+
+fn same_path(lhs: &Path, rhs: &Path) -> bool {
+    match (lhs.canonicalize(), rhs.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => lhs == rhs,
+    }
+}
+
+fn copy_db_from_root(source_root: &Path, db_path: &Path) -> std::io::Result<bool> {
+    let source_db = source_root.join(".source_fast").join("index.db");
+    if !source_db.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::copy(&source_db, db_path)?;
+
+    let source_wal = source_db.with_extension("db-wal");
+    let source_shm = source_db.with_extension("db-shm");
+    let dest_wal = db_path.with_extension("db-wal");
+    let dest_shm = db_path.with_extension("db-shm");
+
+    if source_wal.exists() {
+        let _ = std::fs::copy(&source_wal, &dest_wal);
+    }
+    if source_shm.exists() {
+        let _ = std::fs::copy(&source_shm, &dest_shm);
+    }
+
+    Ok(true)
+}
+
+fn copy_db_from_primary_worktree(root: &Path, db_path: &Path) -> Option<PathBuf> {
+    let Some(primary_root) = primary_worktree_root(root) else {
+        return None;
+    };
+
+    if same_path(&primary_root, root) {
+        return None;
+    }
+
+    match copy_db_from_root(&primary_root, db_path) {
+        Ok(true) => Some(primary_root),
+        _ => None,
+    }
+}
+
+pub(crate) fn open_index_with_worktree_copy(
+    root: &Path,
+    db_path: &Path,
+) -> Result<PersistentIndex, IndexError> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(IndexError::Io)?;
+    }
+
+    if db_path.exists() {
+        match PersistentIndex::open_or_create(db_path) {
+            Ok(index) => return Ok(index),
+            Err(err) => {
+                if !is_corrupt_db(&err) {
+                    return Err(err);
+                }
+                remove_db_files(db_path);
+            }
+        }
+    }
+
+    if let Some(primary_root) = copy_db_from_primary_worktree(root, db_path) {
+        let _ = rewrite_root_paths(db_path, &primary_root, root);
+        match PersistentIndex::open_or_create(db_path) {
+            Ok(index) => return Ok(index),
+            Err(err) => {
+                if !is_corrupt_db(&err) {
+                    return Err(err);
+                }
+                remove_db_files(db_path);
+            }
+        }
+    }
+
+    PersistentIndex::open_or_create(db_path)
 }
 
 /// Initialize tracing for CLI commands (index/search).
@@ -190,7 +317,7 @@ pub async fn run_index_only(
         std::process::exit(1);
     }
 
-    let index = match PersistentIndex::open_or_create(&db_path) {
+    let index = match open_index_with_worktree_copy(&root, &db_path) {
         Ok(idx) => Arc::new(idx),
         Err(err) => {
             error!("Failed to open index database: {}", err);

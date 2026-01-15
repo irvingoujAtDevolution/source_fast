@@ -2607,6 +2607,7 @@ dependencies = [
  "predicates",
  "regex",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

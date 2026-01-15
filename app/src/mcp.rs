@@ -20,7 +20,7 @@ use source_fast_core::{PersistentIndex, extract_snippet};
 use tokio::task;
 use tracing::{error, info, warn};
 
-use crate::cli::{default_db_path, default_root};
+use crate::cli::{default_db_path, default_root, open_index_with_worktree_copy};
 
 #[derive(Clone)]
 pub struct SearchServer {
@@ -135,7 +135,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
     info!("root: {}", root.display());
     info!("db: {}", db_path.display());
 
-    let index = Arc::new(PersistentIndex::open_or_create(&db_path)?);
+    let index = Arc::new(open_index_with_worktree_copy(&root, &db_path)?);
     let index_ready = Arc::new(AtomicBool::new(false));
 
     // Kick off initial indexing in the background so the MCP server can start
