@@ -111,6 +111,19 @@ Add to your Claude Desktop configuration (`claude_desktop_config.json`):
 - Deletion tracking requires git (non-git directories don't track deletions properly)
 - Respects `.gitignore` patterns
 
+## Wildcard `*` search (investigation)
+
+SQLite can’t directly help match `foo*bar` against file contents today because the database does not store
+file contents (only trigrams → file-id bitmaps and file paths). A practical approach is:
+
+- Parse query into literal segments split by unescaped `*`.
+- Choose an “anchor” segment (typically the longest / most trigrams) with length `>= 3` bytes and use the
+  existing trigram index to produce candidate files.
+- Verify the full `*` semantics by scanning candidate file lines and checking that segments appear in order
+  on the same line (fast final filter; keeps correctness).
+
+This keeps the index fast/simple while enabling a lightweight wildcard syntax without a full regex engine.
+
 ## Project Structure
 
 ```
