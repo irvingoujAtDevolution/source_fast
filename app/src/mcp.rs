@@ -16,7 +16,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use source_fast_core::{PersistentIndex, extract_snippet};
+use source_fast_core::PersistentIndex;
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -79,18 +79,23 @@ impl SearchServer {
             })
             .transpose()?;
 
-        let hits = task::spawn_blocking(move || {
-            index.search_filtered(&query_for_search, file_regex.as_ref())
+        let results = task::spawn_blocking(move || {
+            index.search_with_snippets_filtered(&query_for_search, file_regex.as_ref())
         })
         .await
         .map_err(|e| Self::internal_error("search_task_failed", e.to_string()))?
         .map_err(|e| Self::internal_error("search_failed", e.to_string()))?;
 
         let mut contents = Vec::new();
-        for hit in hits {
-            let path = PathBuf::from(&hit.path);
-            match extract_snippet(&path, &query) {
-                Ok(Some(snippet)) => {
+        for result in results {
+            let path = PathBuf::from(&result.path);
+
+            if let Some(err) = result.snippet_error.as_ref() {
+                warn!(path = %path.display(), error = %err, "Failed to extract snippet");
+            }
+
+            match result.snippet {
+                Some(snippet) => {
                     let mut text =
                         format!("File: {}:{}\n", snippet.path.display(), snippet.line_number);
                     for (line_no, line) in snippet.lines {
@@ -98,12 +103,9 @@ impl SearchServer {
                     }
                     contents.push(Content::text(text));
                 }
-                Ok(None) => {
+                None => {
                     let text = format!("File: {}\n", path.display());
                     contents.push(Content::text(text));
-                }
-                Err(err) => {
-                    warn!("Failed to extract snippet from {}: {err}", path.display());
                 }
             }
         }

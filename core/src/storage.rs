@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tracing::{debug, error};
 
 use crate::error::{IndexError, IndexResult};
-use crate::model::SearchHit;
+use crate::model::{SearchHit, SearchResult};
 use crate::text::{collect_trigrams, file_modified_timestamp, normalize_path, read_text_file};
 
 struct FileIdState {
@@ -162,6 +162,19 @@ impl PersistentIndex {
         let conn = Connection::open(&self.db_path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         search_with_conn(&conn, query, file_regex)
+    }
+
+    pub fn search_with_snippets(&self, query: &str) -> IndexResult<Vec<SearchResult>> {
+        self.search_with_snippets_filtered(query, None)
+    }
+
+    pub fn search_with_snippets_filtered(
+        &self,
+        query: &str,
+        file_regex: Option<&Regex>,
+    ) -> IndexResult<Vec<SearchResult>> {
+        let hits = self.search_filtered(query, file_regex)?;
+        Ok(crate::search::attach_snippets(hits, query))
     }
 
     /// Read a value from the meta table, if present.
@@ -752,6 +765,22 @@ mod tests {
 
         let hits = index.search("ab").unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_search_with_snippets() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.db");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() { /* unique_snippet_marker */ }\n").unwrap();
+        index.index_path(&test_file).unwrap();
+        index.flush().unwrap();
+
+        let results = index.search_with_snippets("unique_snippet_marker").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].snippet.is_some(), "Expected snippet for match");
     }
 
     #[test]

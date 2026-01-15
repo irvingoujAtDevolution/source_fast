@@ -4,8 +4,8 @@ use std::sync::Arc;
 use source_fast_fs::{DryRunMode, dry_run_scan, smart_scan};
 use regex::Regex;
 use source_fast_core::{
-    IndexError, PersistentIndex, extract_snippet, rewrite_root_paths,
-    search_database_file_filtered, search_files_in_database,
+    IndexError, PersistentIndex, rewrite_root_paths, search_database_file_with_snippets_filtered,
+    search_files_in_database,
 };
 use tracing::{error, info, warn};
 
@@ -235,30 +235,30 @@ pub async fn run_cli(
         std::process::exit(1);
     }
 
-    let hits = match search_database_file_filtered(&db_path, &query, file_regex.as_ref()) {
-        Ok(h) => h,
+    let results = match search_database_file_with_snippets_filtered(&db_path, &query, file_regex.as_ref()) {
+        Ok(r) => r,
         Err(err) => {
             error!("Search failed: {:?}", err);
             std::process::exit(1);
         }
     };
 
-    for hit in hits {
-        let path = PathBuf::from(&hit.path);
-        match extract_snippet(&path, &query) {
-            Ok(Some(snippet)) => {
+    for result in results {
+        let path = PathBuf::from(&result.path);
+
+        if let Some(err) = result.snippet_error.as_ref() {
+            warn!(path = %path.display(), error = %err, "Failed to extract snippet");
+        }
+
+        match result.snippet {
+            Some(snippet) => {
                 println!("File: {}:{}", snippet.path.display(), snippet.line_number);
                 for (line_no, line) in snippet.lines {
                     println!("{line_no}: {line}");
                 }
                 println!();
             }
-            Ok(None) => {
-                println!("File: {}", path.display());
-            }
-            Err(err) => {
-                warn!("Failed to extract snippet from {}: {err}", path.display());
-            }
+            None => println!("File: {}", path.display()),
         }
     }
 

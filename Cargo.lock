@@ -2623,6 +2623,7 @@ name = "source_fast_core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "rayon",
  "regex",
  "roaring",
  "rusqlite",

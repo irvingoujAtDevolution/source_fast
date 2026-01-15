@@ -12,3 +12,11 @@ pub struct Snippet {
     pub line_number: usize,
     pub lines: Vec<(usize, String)>,
 }
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub file_id: u32,
+    pub path: String,
+    pub snippet: Option<Snippet>,
+    pub snippet_error: Option<String>,
+}
