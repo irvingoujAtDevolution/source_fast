@@ -17,6 +17,8 @@ pub struct TestFixture {
     pub dir: TempDir,
 }
 
+pub mod mcp;
+
 impl TestFixture {
     /// Create a new test environment with a fresh temp directory
     pub fn new() -> Self {

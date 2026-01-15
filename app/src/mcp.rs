@@ -2,6 +2,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use source_fast_fs::{background_watcher, smart_scan};
 use regex::Regex;
@@ -60,12 +61,7 @@ impl SearchServer {
         &self,
         Parameters(args): Parameters<SearchCodeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.index_ready.load(Ordering::SeqCst) {
-            return Err(Self::internal_error(
-                "index_building",
-                "Index is still building; try again shortly",
-            ));
-        }
+        let index_building = !self.index_ready.load(Ordering::SeqCst);
 
         let query = args.query.clone();
         let query_for_search = query.clone();
@@ -87,6 +83,13 @@ impl SearchServer {
         .map_err(|e| Self::internal_error("search_failed", e.to_string()))?;
 
         let mut contents = Vec::new();
+        if index_building {
+            contents.push(Content::text(
+                "Warning (source_fast): index is still building.\n- Returned results come from the existing on-disk index and may be stale/incomplete vs the current working tree.\n- New/modified/deleted files since the index build started might be missing or still present.\n- Retry the same search in a few seconds for up-to-date results.\n"
+                    .to_string(),
+            ));
+        }
+
         for result in results {
             let path = PathBuf::from(&result.path);
 
@@ -140,33 +143,127 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
     let index = Arc::new(open_index_with_worktree_copy(&root, &db_path)?);
     let index_ready = Arc::new(AtomicBool::new(false));
 
-    // Kick off initial indexing in the background so the MCP server can start
-    // responding to requests immediately.
-    let index_for_scan = Arc::clone(&index);
-    let root_for_scan = root.clone();
-    let ready_for_scan = Arc::clone(&index_ready);
-    task::spawn(async move {
-        let res = task::spawn_blocking(move || smart_scan(&root_for_scan, index_for_scan)).await;
-        match res {
-            Ok(Ok(())) => {
-                ready_for_scan.store(true, Ordering::SeqCst);
-                info!("MCP server: initial index build completed");
-            }
-            Ok(Err(err)) => {
-                error!("MCP server: initial index build failed: {err}");
-            }
-            Err(join_err) => {
-                error!("MCP server: initial index task panicked: {join_err}");
-            }
-        }
-    });
+    // Leader election: ensure only one process writes to the index at a time.
+    // If we are not the writer, we still serve best-effort searches.
+    let holder = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("pid:{}:{nanos}", std::process::id())
+    };
+    let lease_ttl = Duration::from_secs(5);
+    let election_index = Arc::clone(&index);
+    let election_root = root.clone();
+    let election_ready = Arc::clone(&index_ready);
+    let is_writer = Arc::new(AtomicBool::new(false));
+    let is_writer_for_task = Arc::clone(&is_writer);
 
-    // Start background file watcher to keep the index up-to-date.
-    let index_for_watcher = Arc::clone(&index);
-    let root_for_watcher = root.clone();
     task::spawn(async move {
-        if let Err(err) = background_watcher(root_for_watcher, index_for_watcher).await {
-            error!("file watcher stopped: {err}");
+        let mut role_logged: Option<&'static str> = None;
+        let mut writer_started = false;
+
+        loop {
+            if !is_writer_for_task.load(Ordering::SeqCst) {
+                let idx = Arc::clone(&election_index);
+                let holder_clone = holder.clone();
+                let acquired = match task::spawn_blocking(move || idx.try_acquire_writer_lease(&holder_clone, lease_ttl)).await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(err)) => {
+                        warn!("leader_election: acquire failed: {err}");
+                        false
+                    }
+                    Err(join_err) => {
+                        warn!("leader_election: acquire task panicked: {join_err}");
+                        false
+                    }
+                };
+
+                if acquired {
+                    election_index.set_write_enabled(true);
+                    is_writer_for_task.store(true, Ordering::SeqCst);
+                    role_logged = None;
+                    info!(role = "writer", "promoted role=writer");
+                } else {
+                    election_index.set_write_enabled(false);
+                    if role_logged != Some("reader") {
+                        info!(role = "reader", "role selected role=reader");
+                        role_logged = Some("reader");
+                    }
+                }
+            }
+
+            if is_writer_for_task.load(Ordering::SeqCst) {
+                if role_logged != Some("writer") {
+                    info!(role = "writer", "role selected role=writer");
+                    role_logged = Some("writer");
+                }
+
+                if !writer_started {
+                    writer_started = true;
+                    // Kick off initial indexing in the background so the MCP server can start
+                    // responding to requests immediately.
+                    let index_for_scan = Arc::clone(&election_index);
+                    let root_for_scan = election_root.clone();
+                    let ready_for_scan = Arc::clone(&election_ready);
+                    task::spawn(async move {
+                        let res =
+                            task::spawn_blocking(move || smart_scan(&root_for_scan, index_for_scan))
+                                .await;
+                        match res {
+                            Ok(Ok(())) => {
+                                ready_for_scan.store(true, Ordering::SeqCst);
+                                info!("MCP server: initial index build completed");
+                            }
+                            Ok(Err(err)) => {
+                                error!("MCP server: initial index build failed: {err}");
+                            }
+                            Err(join_err) => {
+                                error!("MCP server: initial index task panicked: {join_err}");
+                            }
+                        }
+                    });
+
+                    // Start background file watcher to keep the index up-to-date.
+                    let index_for_watcher = Arc::clone(&election_index);
+                    let root_for_watcher = election_root.clone();
+                    task::spawn(async move {
+                        if let Err(err) = background_watcher(root_for_watcher, index_for_watcher).await {
+                            error!("file watcher stopped: {err}");
+                        }
+                    });
+                }
+
+                // Renew lease.
+                let idx = Arc::clone(&election_index);
+                let holder_clone = holder.clone();
+                let renewed = match task::spawn_blocking(move || idx.renew_writer_lease(&holder_clone, lease_ttl)).await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(err)) => {
+                        warn!("leader_election: renew failed: {err}");
+                        false
+                    }
+                    Err(join_err) => {
+                        warn!("leader_election: renew task panicked: {join_err}");
+                        false
+                    }
+                };
+
+                if !renewed {
+                    // Lost leadership; immediately disable writes and revert to reader.
+                    election_index.set_write_enabled(false);
+                    is_writer_for_task.store(false, Ordering::SeqCst);
+                    writer_started = false;
+                    election_ready.store(false, Ordering::SeqCst);
+                    role_logged = None;
+                    info!(role = "reader", "demoted role=reader");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
 
