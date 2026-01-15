@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use source_fast_fs::smart_scan;
+use source_fast_fs::{DryRunMode, dry_run_scan, smart_scan};
 use regex::Regex;
 use source_fast_core::{
     IndexError, PersistentIndex, extract_snippet, rewrite_root_paths,
@@ -331,5 +331,71 @@ pub async fn run_index_only(
     }
 
     info!("Index build completed");
+    Ok(())
+}
+
+fn format_duration(seconds: f64) -> String {
+    if seconds <= 0.0 {
+        return "0s".to_string();
+    }
+
+    let total = seconds.round() as u64;
+    let minutes = total / 60;
+    let secs = total % 60;
+    if minutes == 0 {
+        format!("{secs}s")
+    } else {
+        format!("{minutes}m {secs}s")
+    }
+}
+
+pub async fn run_index_dry_run(
+    root: Option<PathBuf>,
+    db: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = root.unwrap_or_else(default_root);
+    let db_path = db.unwrap_or_else(|| default_db_path(&root));
+
+    if let Some(parent) = db_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        error!(
+            "Failed to create database directory {}: {}",
+            parent.display(),
+            err
+        );
+        std::process::exit(1);
+    }
+
+    let index = match open_index_with_worktree_copy(&root, &db_path) {
+        Ok(idx) => Arc::new(idx),
+        Err(err) => {
+            error!("Failed to open index database: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let info = match dry_run_scan(&root, Arc::clone(&index)) {
+        Ok(info) => info,
+        Err(err) => {
+            error!("Dry-run failed: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Index dry-run");
+    println!(
+        "Mode: {}",
+        match info.mode {
+            DryRunMode::FullScan => "full-scan",
+            DryRunMode::Incremental => "incremental",
+        }
+    );
+    println!("Files to reindex: {}", info.candidate_files);
+    println!(
+        "Estimated time: {}",
+        format_duration(info.estimated_seconds)
+    );
+
     Ok(())
 }

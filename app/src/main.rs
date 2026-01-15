@@ -5,12 +5,21 @@ use clap::{Parser, Subcommand};
 mod cli;
 mod mcp;
 
-use crate::cli::{init_tracing_cli, init_tracing_server, run_cli, run_file_search, run_index_only};
+use crate::cli::{
+    init_tracing_cli, init_tracing_server, run_cli, run_file_search, run_index_dry_run,
+    run_index_only,
+};
 use crate::mcp::run_server;
 
 #[derive(Subcommand, Debug)]
+enum IndexCommand {
+    /// Dry-run: use this to get estimated time for building index
+    DryRun,
+}
+
+#[derive(Subcommand, Debug)]
 enum Command {
-    /// Build or update the index, then exit
+    /// Build or update the index, then exit (run this in background if possible)
     Index {
         /// Root directory to index
         #[arg(long)]
@@ -18,6 +27,8 @@ enum Command {
         /// Path to database file
         #[arg(long)]
         db: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<IndexCommand>,
     },
     /// Search files by path using an existing index
     SearchFile {
@@ -72,9 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     match args.command {
-        Command::Index { root, db } => {
+        Command::Index { root, db, command } => {
             init_tracing_cli();
-            run_index_only(root, db).await?;
+            match command {
+                Some(IndexCommand::DryRun) => run_index_dry_run(root, db).await?,
+                None => run_index_only(root, db).await?,
+            }
         }
         Command::Search {
             root,

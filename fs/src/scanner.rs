@@ -10,6 +10,31 @@ use ignore::{WalkBuilder, WalkState};
 use source_fast_core::{IndexError, PersistentIndex};
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone, Copy)]
+pub enum DryRunMode {
+    FullScan,
+    Incremental,
+}
+
+#[derive(Debug, Clone)]
+pub struct DryRunInfo {
+    pub mode: DryRunMode,
+    pub candidate_files: usize,
+    pub candidate_bytes: u64,
+    pub estimated_seconds: f64,
+}
+
+fn estimate_seconds(files: usize, bytes: u64) -> f64 {
+    if files == 0 {
+        return 0.0;
+    }
+    let files_per_second = 1000.0f64;
+    let bytes_per_second = 50.0f64 * 1024.0 * 1024.0;
+    let by_files = files as f64 / files_per_second;
+    let by_bytes = bytes as f64 / bytes_per_second;
+    by_files.max(by_bytes)
+}
+
 /// Smart scan entry point.
 ///
 /// - If this is the first run (no `git_head` stored) or incremental diff fails,
@@ -118,6 +143,102 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
     Ok(())
 }
 
+pub fn dry_run_scan(
+    root: &Path,
+    index: Arc<PersistentIndex>,
+) -> Result<DryRunInfo, IndexError> {
+    let repo = match gix::discover(root) {
+        Ok(repo) => repo,
+        Err(err) => {
+            debug!("dry_run_scan: no git repository detected: {err}");
+            let (files, bytes) = count_full_scan(root)?;
+            let estimated = estimate_seconds(files, bytes);
+            return Ok(DryRunInfo {
+                mode: DryRunMode::FullScan,
+                candidate_files: files,
+                candidate_bytes: bytes,
+                estimated_seconds: estimated,
+            });
+        }
+    };
+
+    let head = match repo.head_commit() {
+        Ok(commit) => commit,
+        Err(err) => {
+            debug!("dry_run_scan: failed to read git HEAD commit: {err}");
+            let (files, bytes) = count_full_scan(root)?;
+            let estimated = estimate_seconds(files, bytes);
+            return Ok(DryRunInfo {
+                mode: DryRunMode::FullScan,
+                candidate_files: files,
+                candidate_bytes: bytes,
+                estimated_seconds: estimated,
+            });
+        }
+    };
+
+    let current_id = head.id;
+    let current_str = current_id.to_string();
+
+    let stored_head = match index.get_meta("git_head") {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("dry_run_scan: failed to read git_head from meta: {err}");
+            None
+        }
+    };
+
+    let workdir = repo
+        .work_dir()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| root.to_path_buf());
+
+    let mut candidates: HashSet<PathBuf> = HashSet::new();
+    let mode = match stored_head {
+        Some(ref stored) if stored == &current_str => {
+            let worktree_paths = collect_worktree_candidates(&repo, &workdir)?;
+            candidates.extend(worktree_paths);
+            DryRunMode::Incremental
+        }
+        Some(ref stored) => match collect_head_diff_candidates(&repo, &workdir, stored, &current_str)
+        {
+            Ok(diff_paths) => {
+                candidates.extend(diff_paths);
+                let worktree_paths = collect_worktree_candidates(&repo, &workdir)?;
+                candidates.extend(worktree_paths);
+                DryRunMode::Incremental
+            }
+            Err(err) => {
+                warn!("dry_run_scan: incremental diff failed: {err}");
+                let (files, bytes) = count_full_scan(root)?;
+                let estimated = estimate_seconds(files, bytes);
+                return Ok(DryRunInfo {
+                    mode: DryRunMode::FullScan,
+                    candidate_files: files,
+                    candidate_bytes: bytes,
+                    estimated_seconds: estimated,
+                });
+            }
+        },
+        None => {
+            let index_candidates = collect_index_candidates(&repo, &workdir)?;
+            candidates.extend(index_candidates);
+            let worktree_paths = collect_worktree_candidates(&repo, &workdir)?;
+            candidates.extend(worktree_paths);
+            DryRunMode::Incremental
+        }
+    };
+
+    let (files, bytes) = count_candidates(root, candidates);
+    let estimated = estimate_seconds(files, bytes);
+    Ok(DryRunInfo {
+        mode,
+        candidate_files: files,
+        candidate_bytes: bytes,
+        estimated_seconds: estimated,
+    })
+}
+
 fn collect_worktree_candidates(
     repo: &Repository,
     workdir: &Path,
@@ -208,6 +329,36 @@ fn collect_worktree_candidates(
     }
 
     Ok(paths)
+}
+
+fn collect_index_candidates(
+    repo: &Repository,
+    workdir: &Path,
+) -> Result<HashSet<PathBuf>, IndexError> {
+    let mut candidates: HashSet<PathBuf> = HashSet::new();
+
+    match repo.index() {
+        Ok(git_index) => {
+            for entry in git_index.entries() {
+                let rel_path = entry.path(&git_index);
+                let rel_str = match std::str::from_utf8(rel_path.as_bytes()) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!("collect_index_candidates: non-utf8 path in index: {err}");
+                        continue;
+                    }
+                };
+                candidates.insert(workdir.join(rel_str));
+            }
+        }
+        Err(err) => {
+            return Err(IndexError::Encode(format!(
+                "collect_index_candidates: failed to read git index: {err}"
+            )));
+        }
+    }
+
+    Ok(candidates)
 }
 
 fn collect_head_diff_candidates(
@@ -308,6 +459,84 @@ fn collect_head_diff_candidates(
     Ok(paths)
 }
 
+fn count_full_scan(root: &Path) -> Result<(usize, u64), IndexError> {
+    let exclude_dir = root.join(".source_fast");
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            if path.starts_with(&exclude_dir) {
+                return false;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name == ".git"
+            {
+                return false;
+            }
+            true
+        })
+        .build();
+
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                warn!("count_full_scan: failed to read entry: {err}");
+                continue;
+            }
+        };
+
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        files += 1;
+        if let Ok(metadata) = entry.metadata() {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+
+    Ok((files, bytes))
+}
+
+fn count_candidates(root: &Path, candidates: HashSet<PathBuf>) -> (usize, u64) {
+    let exclude_dir = root.join(".source_fast");
+    let git_dir = root.join(".git");
+
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+
+    for path in candidates {
+        if !path.starts_with(root) {
+            continue;
+        }
+        if path.starts_with(&exclude_dir) || path.starts_with(&git_dir) {
+            continue;
+        }
+
+        if path.exists() {
+            if !path.is_file() {
+                continue;
+            }
+            files += 1;
+            if let Ok(metadata) = path.metadata() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        } else {
+            files += 1;
+        }
+    }
+
+    (files, bytes)
+}
+
 fn initial_git_scan(
     root: &Path,
     workdir: &Path,
@@ -338,22 +567,13 @@ fn initial_git_scan(
     let mut candidates: HashSet<PathBuf> = HashSet::new();
 
     // 1. Tracked files: equivalent to `git ls-files` using gix index
-    match repo.index() {
-        Ok(git_index) => {
-            for entry in git_index.entries() {
-                let rel_path = entry.path(&git_index);
-                let rel_str = match std::str::from_utf8(rel_path.as_bytes()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn!("initial_git_scan: non-utf8 path in index: {err}");
-                        continue;
-                    }
-                };
-                candidates.insert(workdir.join(rel_str));
-            }
+    match collect_index_candidates(&repo, workdir) {
+        Ok(index_paths) => {
+            let tracked_count = index_paths.len();
+            candidates.extend(index_paths);
             info!(
                 "initial_git_scan: found {} tracked files from index",
-                candidates.len()
+                tracked_count
             );
         }
         Err(err) => {
