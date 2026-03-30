@@ -24,10 +24,7 @@ fn test_non_git_directory() {
     fix.add_file("src/main.rs", "fn main() { println!(\"hello\"); }");
     fix.add_file("README.md", "# My Project");
 
-    // Index should work without git
-    fix.index();
-
-    // Search should find content
+    // Search triggers daemon + indexing
     let output = fix.search("println");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("main.rs"), "Should find content in non-git directory");
@@ -42,7 +39,6 @@ fn test_non_git_reindex() {
     let fix = TestFixture::new();
 
     fix.add_file("file1.txt", "initial content xyz");
-    fix.index();
 
     // Verify initial content is indexed
     let output1 = fix.search("initial content xyz");
@@ -55,7 +51,9 @@ fn test_non_git_reindex() {
 
     // Add a new file
     fix.add_file("file2.txt", "updated content abc");
-    fix.index();
+
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Both files should be searchable
     let output = fix.search("updated content");
@@ -94,7 +92,6 @@ fn test_many_files() {
     }
 
     fix.git_commit("Add many files");
-    fix.index();
 
     // Search for first and last files
     let output = fix.search("unique_manyfiles_0_marker");
@@ -124,7 +121,6 @@ fn test_many_nested_directories() {
     }
 
     fix.git_commit("Add nested files");
-    fix.index();
 
     // Search for specific nested content
     let output = fix.search("nested_15_3");
@@ -145,7 +141,6 @@ fn test_long_file_path() {
     let long_path = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/deep_file.rs";
     fix.add_file(long_path, "fn deep_nested_function() {}");
     fix.git_commit("Add deeply nested file");
-    fix.index();
 
     let output = fix.search("deep_nested_function");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -163,7 +158,6 @@ fn test_long_filename() {
     let long_name = format!("{}.rs", "a".repeat(100));
     fix.add_file(&long_name, "fn long_filename_content() {}");
     fix.git_commit("Add long filename");
-    fix.index();
 
     let output = fix.search("long_filename_content");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -183,7 +177,6 @@ fn test_search_file_partial_match() {
     fix.add_file("src/lib.rs", "pub mod test;");
     fix.add_file("tests/integration.rs", "// tests");
     fix.git_commit("Add files");
-    fix.index();
 
     // Search for partial filename
     let output = fix.search_file("main");
@@ -203,7 +196,6 @@ fn test_search_file_directory_pattern() {
     fix.add_file("tests/test_main.rs", "// test");
     fix.add_file("docs/guide.md", "# Guide");
     fix.git_commit("Add files");
-    fix.index();
 
     // Search for files in src directory
     let output = fix.search_file("src");
@@ -221,7 +213,6 @@ fn test_search_file_case_insensitive() {
     fix.add_file("README.md", "# Readme");
     fix.add_file("Makefile", "all: build");
     fix.git_commit("Add files");
-    fix.index();
 
     // Search with different cases
     let output = fix.search_file("readme");
@@ -244,7 +235,6 @@ fn test_search_file_by_extension() {
     fix.add_file("code.py", "def main(): pass");
     fix.add_file("code.js", "function main() {}");
     fix.git_commit("Add files");
-    fix.index();
 
     // Search by extension
     let output = fix.search_file(".rs");
@@ -265,7 +255,6 @@ fn test_file_only_newlines() {
     fix.add_file("newlines.txt", "\n\n\n\n\n");
     fix.add_file("normal.txt", "normal content");
     fix.git_commit("Add files");
-    fix.index();
 
     // Should not crash, normal file should be searchable
     let output = fix.search("normal content");
@@ -284,7 +273,6 @@ fn test_file_long_lines() {
     let long_line = format!("// {} unique_marker_xyz", "x".repeat(10000));
     fix.add_file("long_line.rs", &long_line);
     fix.git_commit("Add file with long line");
-    fix.index();
 
     let output = fix.search("unique_marker_xyz");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -301,7 +289,6 @@ fn test_mixed_line_endings() {
     // Mix of CRLF and LF
     fix.add_file("mixed.txt", "line1\r\nline2\nline3\r\nline4_marker");
     fix.git_commit("Add file with mixed endings");
-    fix.index();
 
     let output = fix.search("line4_marker");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -319,7 +306,6 @@ fn test_search_regex_chars() {
 
     fix.add_file("regex.rs", "let pattern = r\".*?\";");
     fix.git_commit("Add file");
-    fix.index();
 
     // Search for literal regex characters
     let output = fix.search(".*?");
@@ -336,7 +322,6 @@ fn test_search_backslashes() {
 
     fix.add_file("paths.rs", r#"let path = "C:\\Users\\test";"#);
     fix.git_commit("Add file");
-    fix.index();
 
     let output = fix.search("Users\\\\test");
     // This test verifies we don't crash; actual matching may vary
@@ -352,7 +337,6 @@ fn test_search_quotes() {
 
     fix.add_file("strings.rs", r#"let msg = "hello \"world\"";"#);
     fix.git_commit("Add file");
-    fix.index();
 
     let output = fix.search("hello");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -372,7 +356,6 @@ fn test_sequential_searches() {
     fix.add_file("file2.txt", "beta_content");
     fix.add_file("file3.txt", "gamma_content");
     fix.git_commit("Add files");
-    fix.index();
 
     // Run multiple searches
     for _ in 0..10 {
@@ -388,7 +371,7 @@ fn test_sequential_searches() {
 
 // ============ Index State Tests ============
 
-/// Test: Index, delete index, reindex
+/// Test: Delete index DB, then search again
 /// Expected: Should rebuild index from scratch
 #[test]
 fn test_delete_and_reindex() {
@@ -397,22 +380,31 @@ fn test_delete_and_reindex() {
 
     fix.add_file("persistent.txt", "persistent_content");
     fix.git_commit("Add file");
-    fix.index();
 
     // Verify indexed
     let output = fix.search("persistent_content");
     assert!(String::from_utf8_lossy(&output.stdout).contains("persistent.txt"));
 
-    // Delete the .source_fast directory
+    // Stop daemon before deleting DB
+    fix.stop();
+
+    // Delete the .source_fast directory (retry on Windows where the daemon
+    // process may still hold file handles briefly after lease release).
     let sf_dir = fix.root().join(".source_fast");
-    if sf_dir.exists() {
-        std::fs::remove_dir_all(&sf_dir).unwrap();
+    for attempt in 0..10 {
+        if !sf_dir.exists() {
+            break;
+        }
+        match std::fs::remove_dir_all(&sf_dir) {
+            Ok(()) => break,
+            Err(_) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => panic!("Failed to remove .source_fast after retries: {e}"),
+        }
     }
 
-    // Reindex
-    fix.index();
-
-    // Should still work
+    // Search should recreate the database and find content
     let output = fix.search("persistent_content");
     assert!(String::from_utf8_lossy(&output.stdout).contains("persistent.txt"));
 }
@@ -429,7 +421,6 @@ fn test_duplicate_content_files() {
     fix.add_file("copy2.txt", content);
     fix.add_file("subdir/copy3.txt", content);
     fix.git_commit("Add duplicate files");
-    fix.index();
 
     let output = fix.search("exactly_the_same");
 
@@ -458,7 +449,6 @@ fn test_various_source_extensions() {
     fix.add_file("code.h", "// header_marker");
     fix.add_file("code.rb", "# ruby_marker");
     fix.git_commit("Add various files");
-    fix.index();
 
     // Each should be searchable
     for marker in &["rust_marker", "python_marker", "javascript_marker", "golang_marker"] {
@@ -480,7 +470,6 @@ fn test_config_files() {
     fix.add_file("config.toml", "config_toml_marker = true");
     fix.add_file(".env.example", "CONFIG_ENV_MARKER=value");
     fix.git_commit("Add config files");
-    fix.index();
 
     let output = fix.search("config_json_marker");
     let stdout = String::from_utf8_lossy(&output.stdout);

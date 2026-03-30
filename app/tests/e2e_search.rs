@@ -17,8 +17,6 @@ fn test_s1_substring_search() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn my_special_function_name() {}");
 
-    fix.index();
-
     // Search for substring (at least 3 chars for trigram)
     let output = fix.search("special_function");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -59,8 +57,6 @@ fn cleanup() {
 "#;
     fix.add_file("src/main.rs", content);
 
-    fix.index();
-
     let output = fix.search("unique_target_line_s2");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -86,9 +82,6 @@ fn cleanup() {
 fn test_s3_mcp_jsonrpc() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn mcp_test_function_s3() {}");
-
-    // First index the files
-    fix.index();
 
     // Start the server
     let mut child = Command::new(env!("CARGO_BIN_EXE_sf"))
@@ -140,8 +133,6 @@ fn test_case_sensitive_search() {
     fix.add_file("src/main.rs", "fn CamelCaseFunction() {}");
     fix.add_file("src/lib.rs", "fn camelcasefunction() {}");
 
-    fix.index();
-
     // Search for exact case
     let output = fix.search("CamelCaseFunction");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -161,8 +152,6 @@ fn third_occurrence() {}
 "#,
     );
 
-    fix.index();
-
     // Should find the file when searching for common substring
     let output = fix.search("occurrence");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -181,8 +170,6 @@ fn test_search_multiple_files() {
     fix.add_file("src/b.rs", "fn shared_pattern_multi() {}");
     fix.add_file("src/c.rs", "fn shared_pattern_multi() {}");
 
-    fix.index();
-
     let output = fix.search("shared_pattern_multi");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -197,8 +184,6 @@ fn test_search_multiple_files() {
 fn test_minimum_query_length() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn ab() {} fn abc() {} fn abcd() {}");
-
-    fix.index();
 
     // 3 char query should work
     let output = fix.search("abc");
@@ -227,8 +212,6 @@ fn test() {
 "#,
     );
 
-    fix.index();
-
     // Search for code with special chars
     let output = fix.search("vec![1, 2, 3]");
     assert!(output.status.success(), "Should not crash on special chars");
@@ -254,8 +237,6 @@ fn test_search_in_comments() {
 fn main() {}
 "#,
     );
-
-    fix.index();
 
     let output = fix.search("unique_comment_marker");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -287,8 +268,6 @@ fn main() {
 }
 "#,
     );
-
-    fix.index();
 
     let output = fix.search("unique_string_content");
     let stdout = String::from_utf8_lossy(&output.stdout);

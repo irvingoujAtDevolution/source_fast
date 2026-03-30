@@ -1,13 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::time::Duration;
 
-use source_fast_fs::{DryRunMode, dry_run_scan, smart_scan};
 use regex::Regex;
 use source_fast_core::{
     IndexError, PersistentIndex, rewrite_root_paths, search_database_file_with_snippets_filtered,
     search_files_in_database,
 };
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+use crate::daemon;
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
 
 pub fn default_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -20,6 +25,10 @@ pub fn default_db_path(root: &Path) -> PathBuf {
     dir.push("index.db");
     dir
 }
+
+// ---------------------------------------------------------------------------
+// DB helpers (shared with daemon)
+// ---------------------------------------------------------------------------
 
 fn remove_db_files(db_path: &Path) {
     let wal = db_path.with_extension("db-wal");
@@ -147,15 +156,22 @@ pub(crate) fn open_index_with_worktree_copy(
     PersistentIndex::open_or_create(db_path)
 }
 
-/// Initialize tracing for CLI commands (index/search).
-///
+// ---------------------------------------------------------------------------
+// Tracing setup
+// ---------------------------------------------------------------------------
+
+/// Initialize tracing for CLI commands (search/stop/status).
 /// Logs go to stderr, and respect RUST_LOG or default to `info`.
 pub fn init_tracing_cli() {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    fmt().with_env_filter(filter).with_target(false).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// Initialize tracing for MCP server.
@@ -170,14 +186,9 @@ pub fn init_tracing_server() {
 
     let path = match std::env::var("SOURCE_FAST_LOG_PATH") {
         Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => {
-            // No log path configured -> do not install any subscriber.
-            return;
-        }
+        _ => return,
     };
 
-    // Try a first open to validate the path. If it fails, we simply
-    // disable logging rather than panicking or printing to stdout/stderr.
     if OpenOptions::new()
         .create(true)
         .append(true)
@@ -187,8 +198,6 @@ pub fn init_tracing_server() {
         return;
     }
 
-    // Re-open the file on each log write. This keeps the MakeWriter simple
-    // and avoids sharing mutable state across threads.
     let make_writer = move || {
         OpenOptions::new()
             .create(true)
@@ -206,11 +215,16 @@ pub fn init_tracing_server() {
         .init();
 }
 
-pub async fn run_cli(
+// ---------------------------------------------------------------------------
+// Search commands (daemon-aware)
+// ---------------------------------------------------------------------------
+
+pub async fn run_search_with_daemon(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
     query: String,
     file_regex: Option<String>,
+    wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
@@ -227,21 +241,52 @@ pub async fn run_cli(
         None
     };
 
-    if !db_path.exists() {
-        error!(
-            "Index database not found at {}. Run `sf index --root <root>` to build the index.",
-            db_path.display()
-        );
-        std::process::exit(1);
+    let first_time = !db_path.exists();
+
+    // Ensure a daemon (or MCP server) is keeping the index warm.
+    let was_running = daemon::ensure_daemon(&root, &db_path)?;
+
+    if first_time {
+        eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
     }
 
-    let results = match search_database_file_with_snippets_filtered(&db_path, &query, file_regex.as_ref()) {
-        Ok(r) => r,
-        Err(err) => {
-            error!("Search failed: {:?}", err);
-            std::process::exit(1);
+    if !was_running {
+        let confirmed = daemon::wait_for_daemon(&db_path, Duration::from_secs(3));
+        if !confirmed {
+            warn!("Daemon did not confirm in 3 s, proceeding with search anyway");
         }
-    };
+    }
+
+    // If --wait, block until index is complete.
+    if wait {
+        if !daemon::wait_for_index_complete(&db_path, Duration::from_secs(120)) {
+            eprintln!("Timed out waiting for index to complete (120 s).");
+        }
+    }
+
+    if !db_path.exists() {
+        // DB hasn't been created yet (daemon just started). Nothing to search.
+        return Ok(());
+    }
+
+    // Check completeness for the disclaimer.
+    let index = PersistentIndex::open_or_create(&db_path)?;
+    if let Ok(Some(status)) = index.get_meta(daemon::meta_keys::INDEX_STATUS) {
+        if status != daemon::index_status::COMPLETE {
+            eprintln!("Note: index is still building. Results may be incomplete.");
+        }
+    }
+    drop(index);
+
+    // Execute the search.
+    let results =
+        match search_database_file_with_snippets_filtered(&db_path, &query, file_regex.as_ref()) {
+            Ok(r) => r,
+            Err(err) => {
+                error!("Search failed: {:?}", err);
+                std::process::exit(1);
+            }
+        };
 
     for result in results {
         let path = PathBuf::from(&result.path);
@@ -265,20 +310,37 @@ pub async fn run_cli(
     Ok(())
 }
 
-pub async fn run_file_search(
+pub async fn run_file_search_with_daemon(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
     pattern: String,
+    wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
+    let first_time = !db_path.exists();
+    let was_running = daemon::ensure_daemon(&root, &db_path)?;
+
+    if first_time {
+        eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
+    }
+
+    if !was_running {
+        let confirmed = daemon::wait_for_daemon(&db_path, Duration::from_secs(3));
+        if !confirmed {
+            warn!("Daemon did not confirm in 3 s, proceeding with search anyway");
+        }
+    }
+
+    if wait {
+        if !daemon::wait_for_index_complete(&db_path, Duration::from_secs(120)) {
+            eprintln!("Timed out waiting for index to complete (120 s).");
+        }
+    }
+
     if !db_path.exists() {
-        error!(
-            "Index database not found at {}. Run `sf index --root <root>` to build the index.",
-            db_path.display()
-        );
-        std::process::exit(1);
+        return Ok(());
     }
 
     let hits = match search_files_in_database(&db_path, &pattern) {
@@ -296,106 +358,93 @@ pub async fn run_file_search(
     Ok(())
 }
 
-pub async fn run_index_only(
+// ---------------------------------------------------------------------------
+// Management commands
+// ---------------------------------------------------------------------------
+
+pub async fn run_stop(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
-
-    info!("Building index for {}", root.display());
-    info!("Database path: {}", db_path.display());
-
-    if let Some(parent) = db_path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        error!(
-            "Failed to create database directory {}: {}",
-            parent.display(),
-            err
-        );
-        std::process::exit(1);
-    }
-
-    let index = match open_index_with_worktree_copy(&root, &db_path) {
-        Ok(idx) => Arc::new(idx),
-        Err(err) => {
-            error!("Failed to open index database: {}", err);
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(err) = smart_scan(&root, Arc::clone(&index)) {
-        error!("Indexing failed: {}", err);
-        std::process::exit(1);
-    }
-
-    info!("Index build completed");
+    daemon::stop_daemon(&db_path)?;
+    println!("Stop requested for {}", root.display());
     Ok(())
 }
 
-fn format_duration(seconds: f64) -> String {
-    if seconds <= 0.0 {
-        return "0s".to_string();
+pub async fn run_stop_all() -> Result<(), Box<dyn std::error::Error>> {
+    let daemons = daemon::list_all_daemons()?;
+    if daemons.is_empty() {
+        println!("No running daemons found.");
+        return Ok(());
     }
-
-    let total = seconds.round() as u64;
-    let minutes = total / 60;
-    let secs = total % 60;
-    if minutes == 0 {
-        format!("{secs}s")
-    } else {
-        format!("{minutes}m {secs}s")
+    for info in &daemons {
+        let db = info
+            .root
+            .join(".source_fast")
+            .join("index.db");
+        daemon::stop_daemon(&db)?;
+        println!("Stop requested for {}", info.root.display());
     }
+    Ok(())
 }
 
-pub async fn run_index_dry_run(
+pub async fn run_status(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
-    if let Some(parent) = db_path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        error!(
-            "Failed to create database directory {}: {}",
-            parent.display(),
-            err
-        );
-        std::process::exit(1);
+    match daemon::daemon_status(&db_path)? {
+        Some(info) => {
+            println!("Root:         {}", info.root.display());
+            println!(
+                "PID:          {}",
+                info.pid
+                    .map_or("unknown".to_string(), |p| p.to_string())
+            );
+            println!(
+                "Version:      {}",
+                info.version.unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "Index status: {}",
+                info.index_status.unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "Leader:       {}",
+                info.leader_holder.unwrap_or_else(|| "none".to_string())
+            );
+        }
+        None => {
+            println!("No daemon running for {}", root.display());
+        }
     }
 
-    let index = match open_index_with_worktree_copy(&root, &db_path) {
-        Ok(idx) => Arc::new(idx),
-        Err(err) => {
-            error!("Failed to open index database: {}", err);
-            std::process::exit(1);
-        }
-    };
+    Ok(())
+}
 
-    let info = match dry_run_scan(&root, Arc::clone(&index)) {
-        Ok(info) => info,
-        Err(err) => {
-            error!("Dry-run failed: {}", err);
-            std::process::exit(1);
-        }
-    };
+pub async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
+    let daemons = daemon::list_all_daemons()?;
+    if daemons.is_empty() {
+        println!("No running daemons found.");
+        return Ok(());
+    }
 
-    println!("Index dry-run");
-    println!(
-        "Mode: {}",
-        match info.mode {
-            DryRunMode::FullScan => "full-scan",
-            DryRunMode::Incremental => "incremental",
-        }
-    );
-    println!("Files to reindex: {}", info.candidate_files);
-    println!(
-        "Estimated time: {}",
-        format_duration(info.estimated_seconds)
-    );
+    for info in &daemons {
+        println!(
+            "{}\tPID={}\tindex={}\tversion={}",
+            info.root.display(),
+            info.pid
+                .map_or("?".to_string(), |p| p.to_string()),
+            info.index_status
+                .as_deref()
+                .unwrap_or("?"),
+            info.version.as_deref().unwrap_or("?"),
+        );
+    }
 
     Ok(())
 }

@@ -262,6 +262,56 @@ impl PersistentIndex {
         tx.commit()?;
         Ok(changed == 1)
     }
+
+    /// Release the writer lease immediately (set expires_at_ms to 0).
+    /// Called on graceful daemon shutdown so the next daemon doesn't have to
+    /// wait for the TTL to expire.
+    pub fn release_writer_lease(&self, holder: &str) -> IndexResult<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+        conn.execute(
+            "UPDATE leader SET expires_at_ms = 0 WHERE name = 'writer' AND holder = ?1",
+            params![holder],
+        )?;
+        Ok(())
+    }
+
+    /// Check whether a writer lease is currently active (not expired).
+    /// Read-only query — does NOT attempt to acquire the lease.
+    pub fn is_leader_active(&self) -> IndexResult<bool> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+        let now = now_millis();
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT expires_at_ms FROM leader WHERE name = 'writer' AND expires_at_ms > ?1",
+                [now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(active.is_some())
+    }
+
+    /// Read the current leader info: (holder, expires_at_ms).
+    /// Returns `None` if no leader row exists or the lease is expired.
+    pub fn read_leader_info(&self) -> IndexResult<Option<(String, i64)>> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+        let now = now_millis();
+        let info: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT holder, expires_at_ms FROM leader WHERE name = 'writer' AND expires_at_ms > ?1",
+                [now],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(info)
+    }
+
+    /// Expose the database path.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
 }
 
 pub fn search_database_file(path: &Path, query: &str) -> IndexResult<Vec<SearchHit>> {

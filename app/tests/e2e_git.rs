@@ -7,7 +7,7 @@ mod common;
 use common::TestFixture;
 
 /// G1: New Commit
-/// Modify a file, commit, and re-index.
+/// Modify a file, commit, and re-search.
 /// Expected: Search finds new content, old content gone.
 #[test]
 fn test_g1_new_commit() {
@@ -15,8 +15,6 @@ fn test_g1_new_commit() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn old_unique_function_g1() {}");
     fix.git_commit("initial commit");
-
-    fix.index();
 
     // Verify old content is found
     let output = fix.search("old_unique_function_g1");
@@ -31,8 +29,8 @@ fn test_g1_new_commit() {
     fix.add_file("src/main.rs", "fn new_unique_function_g1() {}");
     fix.git_commit("update function");
 
-    // Re-index
-    fix.index();
+    // Stop daemon so next search forces a fresh re-scan
+    fix.stop();
 
     // New content should be found
     let output = fix.search("new_unique_function_g1");
@@ -63,13 +61,13 @@ fn test_g2_dirty_state_modified() {
     fix.add_file("src/main.rs", "fn committed_content() {}");
     fix.git_commit("initial");
 
-    fix.index();
+    let _ = fix.search("committed_content");
 
     // Modify without committing
     fix.add_file("src/main.rs", "fn dirty_uncommitted_g2() {}");
 
-    // Re-index should pick up dirty changes
-    fix.index();
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Should find the dirty content
     let output = fix.search("dirty_uncommitted_g2");
@@ -91,13 +89,13 @@ fn test_g3_dirty_state_untracked() {
     fix.add_file("src/main.rs", "fn main() {}");
     fix.git_commit("initial");
 
-    fix.index();
+    let _ = fix.search("main");
 
     // Create new untracked file
     fix.add_file("src/untracked.rs", "fn untracked_unique_g3() {}");
 
-    // Re-index
-    fix.index();
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Should find the untracked file
     let output = fix.search("untracked_unique_g3");
@@ -111,8 +109,7 @@ fn test_g3_dirty_state_untracked() {
 
 /// G4: Branch Switch
 /// Create branch, make changes, commit, switch back.
-/// Expected: Index reflects current branch state after each index.
-/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
+/// Expected: Index reflects current branch state after each search.
 #[test]
 fn test_g4_branch_switch() {
     let fix = TestFixture::new();
@@ -120,17 +117,15 @@ fn test_g4_branch_switch() {
     fix.add_file("src/main.rs", "fn main_branch_content() {}");
     fix.git_commit("initial on main");
 
-    fix.index();
+    let _ = fix.search("main_branch_content");
 
     // Create feature branch
     fix.git_checkout_new("feature");
     fix.add_file("src/feature.rs", "fn feature_only_g4() {}");
     fix.git_commit("feature commit");
 
-    // Index on feature branch
-    fix.index();
-
-    // Should find feature content
+    // Stop + search on feature branch
+    fix.stop();
     let output = fix.search("feature_only_g4");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -140,16 +135,13 @@ fn test_g4_branch_switch() {
     );
 
     // Switch back to main/master
-    // Try "main" first, fall back to "master" if it fails
     let result = fix.git(&["checkout", "main"]);
     if !result.status.success() {
         fix.git(&["checkout", "master"]);
     }
 
-    // Re-index
-    fix.index();
-
-    // Feature content should be gone (file doesn't exist on main)
+    // Stop + search
+    fix.stop();
     let output = fix.search("feature_only_g4");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -162,7 +154,6 @@ fn test_g4_branch_switch() {
 /// G5: Git Reset
 /// Do git reset --hard HEAD~1 to remove recent work.
 /// Expected: Deleted files disappear from search results.
-/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
 fn test_g5_git_reset() {
     let fix = TestFixture::new();
@@ -170,14 +161,13 @@ fn test_g5_git_reset() {
     fix.add_file("src/main.rs", "fn original_g5() {}");
     fix.git_commit("initial");
 
-    fix.index();
+    let _ = fix.search("original_g5");
 
     // Add new file and commit
     fix.add_file("src/to_be_reset.rs", "fn will_be_reset_g5() {}");
     fix.git_commit("add file to be reset");
 
-    // Index should find it
-    fix.index();
+    fix.stop();
     let output = fix.search("will_be_reset_g5");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -189,10 +179,7 @@ fn test_g5_git_reset() {
     // Reset back
     fix.git_reset_hard("HEAD~1");
 
-    // Re-index
-    fix.index();
-
-    // Ghost match should be gone
+    fix.stop();
     let output = fix.search("will_be_reset_g5");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -221,8 +208,6 @@ fn test_g6_git_ignore() {
     fix.add_file("secret.key", "api_key_g6_should_not_index=12345");
     fix.add_file("config.secret", "password_g6_secret=hunter2");
 
-    fix.index();
-
     // Should NOT find ignored file content
     let output = fix.search("api_key_g6_should_not_index");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -248,15 +233,16 @@ fn test_incremental_multiple_commits() {
     fix.git_init();
     fix.add_file("src/v1.rs", "fn version_one() {}");
     fix.git_commit("v1");
-    fix.index();
+    let _ = fix.search("version_one");
 
     fix.add_file("src/v2.rs", "fn version_two() {}");
     fix.git_commit("v2");
-    fix.index();
+    fix.stop();
+    let _ = fix.search("version_two");
 
     fix.add_file("src/v3.rs", "fn version_three() {}");
     fix.git_commit("v3");
-    fix.index();
+    fix.stop();
 
     // All versions should be found
     let output = fix.search("version_one");

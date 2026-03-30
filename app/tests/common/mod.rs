@@ -10,20 +10,29 @@ use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+use std::sync::{Mutex, MutexGuard};
 
 /// Test fixture providing a temporary directory with helper methods
 /// for file operations, git commands, and running the `sf` CLI.
 pub struct TestFixture {
     pub dir: TempDir,
+    _guard: MutexGuard<'static, ()>,
 }
 
 pub mod mcp;
 
+// E2E tests spawn detached daemon processes and rely on filesystem observation.
+// Running them concurrently inside the same test binary leads to sporadic
+// partial-result failures on Windows. Serialize `TestFixture` users per binary.
+static TEST_FIXTURE_MUTEX: Mutex<()> = Mutex::new(());
+
 impl TestFixture {
     /// Create a new test environment with a fresh temp directory
     pub fn new() -> Self {
+        let guard = TEST_FIXTURE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         Self {
             dir: TempDir::new().unwrap(),
+            _guard: guard,
         }
     }
 
@@ -145,37 +154,96 @@ impl TestFixture {
         ["--root".into(), self.root().into()]
     }
 
-    /// Run sf index and assert success
-    pub fn index(&self) -> &Self {
-        self.sf()
-            .arg("index")
-            .arg("--root")
-            .arg(self.root())
-            .assert()
-            .success();
-        self
-    }
-
-    /// Run sf search and return the output
+    /// Run sf search with --wait (blocks until index is complete).
+    /// This auto-starts the daemon if not running.
     pub fn search(&self, query: &str) -> std::process::Output {
         self.sf()
             .arg("search")
             .arg("--root")
             .arg(self.root())
+            .arg("--wait")
             .arg(query)
             .output()
             .expect("sf search failed")
     }
 
-    /// Run sf search-file and return the output
+    /// Run sf search-file with --wait (blocks until index is complete).
     pub fn search_file(&self, pattern: &str) -> std::process::Output {
         self.sf()
             .arg("search-file")
             .arg("--root")
             .arg(self.root())
+            .arg("--wait")
             .arg(pattern)
             .output()
             .expect("sf search-file failed")
+    }
+
+    /// Stop the daemon for this repo. Use between test phases that modify files
+    /// to force a fresh daemon re-scan on the next search.
+    ///
+    /// Polls the DB to confirm the leader lease is released, with a 10 s
+    /// timeout. This is more reliable under load than a fixed sleep.
+    pub fn stop(&self) {
+        let _ = self
+            .sf()
+            .arg("stop")
+            .arg("--root")
+            .arg(self.root())
+            .output();
+
+        // Poll until the lease is released (or 10 s timeout).
+        let db_path = self.db_path();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !db_path.exists() {
+                break;
+            }
+            if let Ok(idx) = source_fast_core::PersistentIndex::open_or_create(&db_path) {
+                if let Ok(false) = idx.is_leader_active() {
+                    // Lease released — add brief extra sleep for Windows file handle cleanup.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get the daemon status for this repo.
+    pub fn status(&self) -> std::process::Output {
+        self.sf()
+            .arg("status")
+            .arg("--root")
+            .arg(self.root())
+            .output()
+            .expect("sf status failed")
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        // Clean up any daemon process running for this repo.
+        let _ = StdCommand::new(env!("CARGO_BIN_EXE_sf"))
+            .arg("stop")
+            .arg("--root")
+            .arg(self.dir.path())
+            .output();
+        // Wait for daemon to release DB files. Poll leader table if DB exists.
+        let db_path = self.dir.path().join(".source_fast").join("index.db");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !db_path.exists() {
+                break;
+            }
+            if let Ok(idx) = source_fast_core::PersistentIndex::open_or_create(&db_path) {
+                if let Ok(false) = idx.is_leader_active() {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    break;
+                }
+            }
+        }
     }
 }
 

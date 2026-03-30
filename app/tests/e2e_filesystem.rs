@@ -7,10 +7,9 @@ mod common;
 use common::TestFixture;
 
 /// F1: Deletion
-/// Delete a file and re-index.
+/// Delete a file and re-search.
 /// Expected: Search for unique string in deleted file returns 0 results.
 /// Note: Deletion tracking requires git - the tool is designed for git repos.
-/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
 fn test_f1_deletion() {
     let fix = TestFixture::new();
@@ -18,8 +17,6 @@ fn test_f1_deletion() {
     fix.add_file("src/main.rs", "fn main() {}");
     fix.add_file("src/to_delete.rs", "fn unique_deletable_function() {}");
     fix.git_commit("initial");
-
-    fix.index();
 
     // Verify it's indexed
     let output = fix.search("unique_deletable_function");
@@ -34,8 +31,8 @@ fn test_f1_deletion() {
     fix.remove_file("src/to_delete.rs");
     fix.git_commit("delete file");
 
-    // Re-index
-    fix.index();
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Should no longer find the deleted content
     let output = fix.search("unique_deletable_function");
@@ -48,18 +45,15 @@ fn test_f1_deletion() {
 }
 
 /// F2: Rename
-/// Rename a file and re-index.
+/// Rename a file and re-search.
 /// Expected: Search returns new name, not old name.
 /// Note: Rename tracking requires git - the tool is designed for git repos.
-/// Fixed: normalize_path() now handles deleted files by canonicalizing parent directory.
 #[test]
 fn test_f2_rename() {
     let fix = TestFixture::new();
     fix.git_init();
     fix.add_file("src/old_name.rs", "fn renamed_function_content() {}");
     fix.git_commit("initial");
-
-    fix.index();
 
     // Verify old name is found
     let output = fix.search("renamed_function_content");
@@ -74,8 +68,7 @@ fn test_f2_rename() {
     fix.git(&["mv", "src/old_name.rs", "src/new_name.rs"]);
     fix.git_commit("rename file");
 
-    // Re-index
-    fix.index();
+    fix.stop();
 
     // Should find new name
     let output = fix.search("renamed_function_content");
@@ -111,10 +104,7 @@ fn test_f3_binary_file() {
     ];
     fix.add_binary("assets/icon.png", &binary_content);
 
-    // Should not crash during indexing
-    fix.index();
-
-    // Search should work for text files
+    // Search should work for text files (daemon auto-starts, indexes)
     let output = fix.search("main");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -137,13 +127,9 @@ fn test_f4_null_byte_injection() {
         .to_vec();
     fix.add_binary("src/sneaky.rs", &content_with_null);
 
-    // Should not crash
-    fix.index();
-
     // The file with null bytes should be skipped (treated as binary)
     let output = fix.search("looks_like_text");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // It should NOT find content from the binary-ish file
     assert!(
         !stdout.contains("sneaky.rs"),
         "File with null bytes should be treated as binary: {}",
@@ -159,9 +145,6 @@ fn test_f5_empty_file() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn main() {}");
     fix.add_file("src/empty.rs", ""); // Empty file
-
-    // Should not crash
-    fix.index();
 
     // Search should still work
     let output = fix.search("main");
@@ -180,8 +163,8 @@ fn test_tiny_file() {
     fix.add_file("src/main.rs", "fn main() {}");
     fix.add_file("src/tiny.rs", "x"); // Only 1 char
 
-    // Should not crash
-    fix.index();
+    // Should not crash (search triggers indexing)
+    let _ = fix.search("main");
 }
 
 /// Additional: File with only whitespace
@@ -192,7 +175,7 @@ fn test_whitespace_only_file() {
     fix.add_file("src/spaces.rs", "   \n\n\t\t  \n");
 
     // Should not crash
-    fix.index();
+    let _ = fix.search("main");
 }
 
 /// Additional: Unicode content
@@ -203,8 +186,6 @@ fn test_unicode_content() {
         "src/unicode.rs",
         "fn greet() { println!(\"你好世界 🌍 مرحبا\"); }",
     );
-
-    fix.index();
 
     // Should be able to search for unicode
     let output = fix.search("你好世界");
@@ -224,8 +205,6 @@ fn test_deeply_nested_file() {
         "src/a/b/c/d/e/deep.rs",
         "fn deeply_nested_unique_function() {}",
     );
-
-    fix.index();
 
     let output = fix.search("deeply_nested_unique");
     let stdout = String::from_utf8_lossy(&output.stdout);

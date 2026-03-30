@@ -13,21 +13,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".source_fast").join("index.db")
 }
 
+/// Trigger daemon start + full indexing via `sf search --wait`.
+/// The query doesn't matter; we need the indexing side effect.
 fn sf_index(root: &Path) {
-    Command::cargo_bin("sf")
+    let output = Command::cargo_bin("sf")
         .unwrap()
         .current_dir(root)
-        .arg("index")
+        .arg("search")
         .arg("--root")
         .arg(root)
-        .assert()
-        .success();
+        .arg("--wait")
+        .arg("_ensure_indexed_")
+        .output()
+        .expect("sf search --wait failed");
+    assert!(
+        output.status.success(),
+        "sf search --wait failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn sf_search(root: &Path, query: &str) -> String {
@@ -37,10 +46,40 @@ fn sf_search(root: &Path, query: &str) -> String {
         .arg("search")
         .arg("--root")
         .arg(root)
+        .arg("--wait")
         .arg(query)
         .output()
         .expect("sf search failed");
+    assert!(
+        output.status.success(),
+        "sf search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn sf_stop(root: &Path) {
+    let _ = Command::cargo_bin("sf")
+        .unwrap()
+        .arg("stop")
+        .arg("--root")
+        .arg(root)
+        .output();
+
+    let db_path = db_path(root);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        if !db_path.exists() {
+            break;
+        }
+        if let Ok(idx) = PersistentIndex::open_or_create(&db_path) {
+            if let Ok(false) = idx.is_leader_active() {
+                std::thread::sleep(Duration::from_millis(500));
+                break;
+            }
+        }
+    }
 }
 
 fn set_meta(root: &Path, key: &str, value: &str) {
@@ -123,7 +162,7 @@ fn test_wt1_copy_preserves_meta_marker() {
     fix.add_file("src/main.rs", "fn main() { /* wt1 */ }");
     fix.git_commit("initial");
 
-    fix.index();
+    let _ = fix.search("wt1");
 
     set_meta(&fix.root(), "worktree_copy_marker", "main");
 
@@ -139,6 +178,8 @@ fn test_wt1_copy_preserves_meta_marker() {
         Some("main"),
         "worktree DB should preserve meta marker"
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT2: Worktree copy + smart_scan removes stale entries.
@@ -148,7 +189,7 @@ fn test_wt2_copy_removes_stale_entries() {
     fix.git_init();
     fix.add_file("src/stale.rs", "fn stale_unique_wt2() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("stale_unique_wt2");
 
     let output = fix.git(&["branch", "feature"]);
     assert_git_ok(&output, "git branch feature");
@@ -174,6 +215,8 @@ fn test_wt2_copy_removes_stale_entries() {
         "stale file should be removed from worktree index: {}",
         stdout
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT3: Worktree copy + smart_scan picks up untracked files.
@@ -183,7 +226,7 @@ fn test_wt3_copy_picks_up_untracked_files() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn base_unique_wt3() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("base_unique_wt3");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -201,6 +244,8 @@ fn test_wt3_copy_picks_up_untracked_files() {
         "untracked file should be indexed in worktree: {}",
         stdout
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT4: Worktree copy + smart_scan updates modified tracked files.
@@ -210,7 +255,7 @@ fn test_wt4_copy_updates_modified_tracked_file() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn old_content_wt4() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("old_content_wt4");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -227,6 +272,8 @@ fn test_wt4_copy_updates_modified_tracked_file() {
 
     assert_search_contains(worktree_root, "new_content_wt4", "main.rs");
     assert_search_not_contains(worktree_root, "old_content_wt4", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT5: Worktree copy + smart_scan handles mixed dirty state.
@@ -237,7 +284,7 @@ fn test_wt5_copy_handles_mixed_dirty_state() {
     fix.add_file("src/keep.rs", "fn keep_unique_wt5() {}");
     fix.add_file("src/delete.rs", "fn delete_unique_wt5() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("keep_unique_wt5");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -252,6 +299,8 @@ fn test_wt5_copy_handles_mixed_dirty_state() {
     assert_search_contains(worktree_root, "keep_modified_wt5", "keep.rs");
     assert_search_contains(worktree_root, "new_unique_wt5", "new.rs");
     assert_search_not_contains(worktree_root, "delete_unique_wt5", "delete.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT6: Search paths should reflect the worktree root, not the main root.
@@ -261,7 +310,7 @@ fn test_wt6_paths_resolved_to_worktree_root() {
     fix.git_init();
     fix.add_file("src/path.rs", "fn path_unique_wt6() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("path_unique_wt6");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -280,6 +329,8 @@ fn test_wt6_paths_resolved_to_worktree_root() {
         !stdout.contains(&main_root),
         "Output should not reference main root path: {stdout}"
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT7: Renames in a worktree should update paths.
@@ -289,7 +340,7 @@ fn test_wt7_copy_handles_rename() {
     fix.git_init();
     fix.add_file("src/old_name.rs", "fn rename_unique_wt7() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("rename_unique_wt7");
 
     let output = fix.git(&["branch", "rename-branch"]);
     assert_git_ok(&output, "git branch rename-branch");
@@ -315,6 +366,8 @@ fn test_wt7_copy_handles_rename() {
         !stdout.contains("old_name.rs"),
         "Old path should not appear: {stdout}"
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT8: No source DB available should still allow indexing in worktree.
@@ -331,6 +384,8 @@ fn test_wt8_no_source_db_fallback() {
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "fallback_unique_wt8", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT9: Corrupted DB should be rebuilt and still allow search.
@@ -340,7 +395,7 @@ fn test_wt9_corrupted_db_rebuilds() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn corrupt_unique_wt9() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("corrupt_unique_wt9");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -354,6 +409,8 @@ fn test_wt9_corrupted_db_rebuilds() {
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "corrupt_unique_wt9", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT10: Missing schema should be repaired and indexing should succeed.
@@ -363,7 +420,7 @@ fn test_wt10_missing_schema_rebuilds() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn schema_unique_wt10() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("schema_unique_wt10");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -382,6 +439,8 @@ fn test_wt10_missing_schema_rebuilds() {
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "schema_unique_wt10", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT11: Invalid stored git_head should be handled (full scan fallback).
@@ -391,7 +450,7 @@ fn test_wt11_invalid_git_head_fallback() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn invalid_head_wt11() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("invalid_head_wt11");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -401,6 +460,8 @@ fn test_wt11_invalid_git_head_fallback() {
     sf_index(worktree_root);
 
     assert_search_contains(worktree_root, "invalid_head_wt11", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT12: Same-commit worktree should index without errors.
@@ -410,7 +471,7 @@ fn test_wt12_same_commit_no_dirty() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn same_commit_wt12() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("same_commit_wt12");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -418,6 +479,8 @@ fn test_wt12_same_commit_no_dirty() {
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "same_commit_wt12", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT13: Different commit (reachable) should update the index.
@@ -427,7 +490,7 @@ fn test_wt13_different_commit_reachable() {
     fix.git_init();
     fix.add_file("src/old.rs", "fn old_wt13() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("old_wt13");
 
     let output = fix.git(&["branch", "feature-wt13"]);
     assert_git_ok(&output, "git branch feature-wt13");
@@ -448,6 +511,8 @@ fn test_wt13_different_commit_reachable() {
 
     assert_search_contains(worktree_root, "new_wt13", "new.rs");
     assert_search_not_contains(worktree_root, "old_wt13", "old.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT14: Missing old commit should fall back to full scan.
@@ -457,7 +522,7 @@ fn test_wt14_missing_old_commit_fallback() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn missing_commit_wt14() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("missing_commit_wt14");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -467,6 +532,8 @@ fn test_wt14_missing_old_commit_fallback() {
     sf_index(worktree_root);
 
     assert_search_contains(worktree_root, "missing_commit_wt14", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT15: Concurrent worktree indexing should not corrupt DBs.
@@ -476,7 +543,7 @@ fn test_wt15_concurrent_worktree_indexing() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn concurrent_wt15() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("concurrent_wt15");
 
     let worktree_dir_a = TempDir::new().unwrap();
     let worktree_root_a = worktree_dir_a.path().to_path_buf();
@@ -509,6 +576,9 @@ fn test_wt15_concurrent_worktree_indexing() {
 
     assert!(output_a.contains("main.rs"), "Worktree A search failed");
     assert!(output_b.contains("main.rs"), "Worktree B search failed");
+
+    sf_stop(&root_a);
+    sf_stop(&root_b);
 }
 
 /// WT16: Re-indexing after copy still updates content (writer thread running).
@@ -518,7 +588,7 @@ fn test_wt16_reindex_updates_after_copy() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn initial_wt16() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("initial_wt16");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -527,9 +597,14 @@ fn test_wt16_reindex_updates_after_copy() {
     sf_index(worktree_root);
 
     write_file(worktree_root, "src/main.rs", "fn updated_wt16() {}");
+
+    // Stop daemon so next search re-scans with fresh content
+    sf_stop(worktree_root);
     sf_index(worktree_root);
 
     assert_search_contains(worktree_root, "updated_wt16", "main.rs");
+
+    sf_stop(worktree_root);
 }
 
 /// WT17: Indexing should update git_head in meta.
@@ -539,7 +614,7 @@ fn test_wt17_git_head_updates() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn head_update_wt17() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("head_update_wt17");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -550,6 +625,8 @@ fn test_wt17_git_head_updates() {
     let head = git_head(worktree_root);
     let stored = get_meta(worktree_root, "git_head");
     assert_eq!(stored.as_deref(), Some(head.as_str()));
+
+    sf_stop(worktree_root);
 }
 
 /// WT18: Path normalization on Windows should use absolute paths.
@@ -559,7 +636,7 @@ fn test_wt18_paths_are_absolute() {
     fix.git_init();
     fix.add_file("src/main.rs", "fn absolute_path_wt18() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("absolute_path_wt18");
 
     let worktree_dir = TempDir::new().unwrap();
     let worktree_root = worktree_dir.path();
@@ -589,6 +666,8 @@ fn test_wt18_paths_are_absolute() {
             "Expected no forward slashes in Windows path, got: {file_part}"
         );
     }
+
+    sf_stop(worktree_root);
 }
 
 /// WT19: Performance guardrail for worktree copy (ignored by default).
@@ -606,7 +685,7 @@ fn test_wt19_copy_is_faster_than_full_scan() {
     fix.git_commit("many files");
 
     let start_full = Instant::now();
-    fix.index();
+    let _ = fix.search("perf_marker_0");
     let full_duration = start_full.elapsed();
 
     let worktree_dir = TempDir::new().unwrap();
@@ -621,6 +700,8 @@ fn test_wt19_copy_is_faster_than_full_scan() {
         copy_duration <= full_duration * 2,
         "Expected worktree index to be faster (or comparable). full={full_duration:?}, worktree={copy_duration:?}"
     );
+
+    sf_stop(worktree_root);
 }
 
 /// WT20: Copy failure should fall back to full scan.
@@ -647,4 +728,6 @@ fn test_wt20_copy_failure_fallbacks_to_full_scan() {
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "copy_fail_wt20", "main.rs");
+
+    sf_stop(worktree_root);
 }

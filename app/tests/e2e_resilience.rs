@@ -21,8 +21,8 @@ fn test_r1_reindex_after_partial_state() {
     fix.add_file("src/lib.rs", "fn lib() {}");
     fix.git_commit("initial");
 
-    // Index once
-    fix.index();
+    // Index once via search
+    let _ = fix.search("main");
 
     // Add more files
     for i in 0..10 {
@@ -30,8 +30,8 @@ fn test_r1_reindex_after_partial_state() {
     }
     fix.git_commit("add more files");
 
-    // Re-index should work correctly
-    fix.index();
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Verify search works
     let output = fix.search("func_5");
@@ -53,15 +53,15 @@ fn test_r2_history_rewrite() {
 
     fix.add_file("src/main.rs", "fn before_rewrite() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("before_rewrite");
 
     // Simulate rewrite by amending (changes commit hash)
     fix.add_file("src/main.rs", "fn after_rewrite_r2() {}");
     fix.git(&["add", "."]);
     fix.git(&["commit", "--amend", "-m", "amended initial"]);
 
-    // Re-index should handle the changed hash
-    fix.index();
+    // Stop daemon so next search re-scans
+    fix.stop();
 
     // Should find the new content
     let output = fix.search("after_rewrite_r2");
@@ -73,14 +73,16 @@ fn test_r2_history_rewrite() {
     );
 }
 
-/// R3: Locked DB (Concurrent Access)
-/// Start server, then try CLI index.
-/// Expected: Should handle gracefully.
+/// R3: Concurrent Access
+/// Start MCP server, then try CLI search.
+/// Expected: Should handle gracefully (leader election prevents conflicts).
 #[test]
 fn test_r3_concurrent_access() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn main() {}");
-    fix.index();
+
+    // First search to create DB and index
+    let _ = fix.search("main");
 
     // Start server in background
     let mut server = Command::new(env!("CARGO_BIN_EXE_sf"))
@@ -93,39 +95,19 @@ fn test_r3_concurrent_access() {
         .spawn()
         .expect("Failed to start server");
 
-    // Give server time to start and lock DB
+    // Give server time to start and acquire lease
     std::thread::sleep(Duration::from_millis(500));
 
-    // Try to run CLI index - may succeed (WAL mode allows concurrent readers)
-    // or may error gracefully
-    let result = fix
-        .sf()
-        .arg("index")
-        .arg("--root")
-        .arg(fix.root())
-        .output();
+    // Try to run CLI search - should work (daemon or server holds the lease,
+    // search is read-only from the CLI's perspective)
+    let output = fix.search("main");
 
     // Clean up server
     let _ = server.kill();
     let _ = server.wait();
 
-    // The test passes if either:
-    // 1. The command succeeded (WAL mode allows this)
-    // 2. The command failed gracefully (no panic)
-    match result {
-        Ok(output) => {
-            // Either success or graceful error
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success() || stderr.contains("locked") || stderr.contains("busy"),
-                "Should either succeed or fail gracefully: {}",
-                stderr
-            );
-        }
-        Err(_) => {
-            // Command failed to run, which is also acceptable
-        }
-    }
+    // The test passes if search didn't crash
+    assert!(output.status.success(), "Search should succeed with concurrent server");
 }
 
 /// R4: Corrupt DB Recovery
@@ -136,10 +118,7 @@ fn test_r4_corrupt_db_recovery() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn recoverable_content_r4() {}");
 
-    // Initial index
-    fix.index();
-
-    // Verify search works
+    // Initial search triggers indexing
     let output = fix.search("recoverable_content_r4");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -148,10 +127,22 @@ fn test_r4_corrupt_db_recovery() {
         stdout
     );
 
-    // Delete the database
+    // Stop daemon before deleting DB
+    fix.stop();
+
+    // Delete the database (retry on Windows file locks).
     let db_path = fix.db_path();
-    if db_path.exists() {
-        std::fs::remove_file(&db_path).expect("Failed to delete DB");
+    for attempt in 0..10 {
+        if !db_path.exists() {
+            break;
+        }
+        match std::fs::remove_file(&db_path) {
+            Ok(()) => break,
+            Err(_) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => panic!("Failed to delete DB after retries: {e}"),
+        }
     }
 
     // Also remove any WAL/shm files
@@ -160,10 +151,7 @@ fn test_r4_corrupt_db_recovery() {
     let _ = std::fs::remove_file(wal_path);
     let _ = std::fs::remove_file(shm_path);
 
-    // Re-index should recreate the database
-    fix.index();
-
-    // Search should work again
+    // Search should recreate the database
     let output = fix.search("recoverable_content_r4");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -179,18 +167,28 @@ fn test_missing_source_fast_dir() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn test_missing_dir() {}");
 
-    // Index creates the directory
-    fix.index();
+    // Search creates the directory and indexes
+    let _ = fix.search("test_missing_dir");
 
-    // Remove entire .source_fast directory
+    // Stop daemon
+    fix.stop();
+
+    // Remove entire .source_fast directory (retry on Windows file locks).
     let sf_dir = fix.root().join(".source_fast");
-    if sf_dir.exists() {
-        std::fs::remove_dir_all(&sf_dir).expect("Failed to remove .source_fast");
+    for attempt in 0..10 {
+        if !sf_dir.exists() {
+            break;
+        }
+        match std::fs::remove_dir_all(&sf_dir) {
+            Ok(()) => break,
+            Err(_) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => panic!("Failed to remove .source_fast after retries: {e}"),
+        }
     }
 
-    // Re-index should recreate everything
-    fix.index();
-
+    // Search should recreate everything
     let output = fix.search("test_missing_dir");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -200,18 +198,19 @@ fn test_missing_source_fast_dir() {
     );
 }
 
-/// Additional: Index with no files
+/// Additional: Search with no files (empty directory)
 #[test]
-fn test_index_empty_directory() {
+fn test_search_empty_directory() {
     let fix = TestFixture::new();
 
-    // Index empty directory should not crash
-    fix.index();
+    // Search empty directory should not crash
+    let output = fix.search("nonexistent_query");
+    assert!(output.status.success(), "Search on empty directory should not crash");
 }
 
-/// Additional: Index directory with only ignored files
+/// Additional: Search directory with only ignored files
 #[test]
-fn test_index_only_ignored() {
+fn test_search_only_ignored() {
     let fix = TestFixture::new();
     fix.git_init();
     fix.git_ignore("*.ignored");
@@ -219,7 +218,8 @@ fn test_index_only_ignored() {
     fix.git_commit("initial");
 
     // Should not crash
-    fix.index();
+    let output = fix.search("ignored content");
+    assert!(output.status.success(), "Search with only ignored files should not crash");
 }
 
 /// Additional: Very large file handling
@@ -234,8 +234,6 @@ fn test_large_file() {
 
     fix.add_file("src/large.rs", &large_content);
     fix.add_file("src/small.rs", "fn small_marker() {}");
-
-    fix.index();
 
     // Should find content in both files
     let output = fix.search("function_500");
@@ -264,13 +262,14 @@ fn test_rapid_changes() {
     fix.git_init();
     fix.add_file("main.rs", "fn initial() {}");
     fix.git_commit("initial");
-    fix.index();
+    let _ = fix.search("initial");
 
     // Rapid changes with git commits
     for i in 0..5 {
         fix.add_file("main.rs", &format!("fn rapid_change_{}() {{}}", i));
         fix.git_commit(&format!("change {}", i));
-        fix.index();
+        fix.stop();
+        let _ = fix.search(&format!("rapid_change_{}", i));
     }
 
     // Should have the latest content
