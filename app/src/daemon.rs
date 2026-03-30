@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use source_fast_core::PersistentIndex;
-use source_fast_fs::{background_watcher, smart_scan};
+use source_fast_fs::{background_watcher, smart_scan_with_progress};
+use source_fast_progress::{IndexProgress, ScanEvent};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
@@ -13,6 +15,7 @@ use tracing::{debug, error, info, warn};
 pub mod meta_keys {
     pub const SHUTDOWN_REQUESTED: &str = "shutdown_requested";
     pub const INDEX_STATUS: &str = "index_status";
+    pub const INDEX_PROGRESS: &str = "index_progress";
     pub const DAEMON_PID: &str = "daemon_pid";
     pub const DAEMON_VERSION: &str = "daemon_version";
 }
@@ -29,6 +32,7 @@ pub struct DaemonInfo {
     pub pid: Option<u32>,
     pub version: Option<String>,
     pub index_status: Option<String>,
+    pub progress: Option<IndexProgress>,
     pub leader_holder: Option<String>,
     pub leader_expires_ms: Option<i64>,
 }
@@ -81,6 +85,20 @@ fn init_daemon_tracing(db_path: &Path) {
         .init();
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn persist_progress(index: &PersistentIndex, progress: &IndexProgress) {
+    if let Ok(json) = serde_json::to_string(progress) {
+        let _ = index.set_meta(meta_keys::INDEX_PROGRESS, &json);
+    }
+}
+
 /// The actual daemon main loop (invoked by `sf _daemon`).
 /// Extracted from the MCP server's election loop in mcp.rs.
 pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -111,6 +129,7 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
     let lease_ttl = Duration::from_secs(5);
     let is_writer = Arc::new(AtomicBool::new(false));
     let index_ready = Arc::new(AtomicBool::new(false));
+    persist_progress(&index, &IndexProgress::building(now_ms()));
 
     let mut writer_started = false;
     let mut give_up_count = 0u32;
@@ -170,20 +189,55 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                 let index_for_scan = Arc::clone(&index);
                 let root_for_scan = root.clone();
                 let ready_for_scan = Arc::clone(&index_ready);
+                let index_for_progress = Arc::clone(&index);
                 task::spawn(async move {
+                    let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
+                    let progress_thread = std::thread::spawn(move || {
+                        let mut progress = IndexProgress::building(now_ms());
+                        persist_progress(&index_for_progress, &progress);
+                        loop {
+                            match progress_rx.recv_timeout(Duration::from_millis(500)) {
+                                Ok(event) => {
+                                    progress.apply_event(event, now_ms());
+                                    persist_progress(&index_for_progress, &progress);
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    persist_progress(&index_for_progress, &progress);
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    persist_progress(&index_for_progress, &progress);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    let final_progress_tx = progress_tx.clone();
+                    let progress_callback: Arc<dyn Fn(ScanEvent) + Send + Sync> =
+                        Arc::new(move |event| {
+                            let _ = progress_tx.send(event);
+                        });
                     let res = task::spawn_blocking(move || {
-                        smart_scan(&root_for_scan, index_for_scan)
+                        smart_scan_with_progress(&root_for_scan, index_for_scan, progress_callback)
                     })
                     .await;
                     match res {
                         Ok(Ok(())) => {
+                            let _ = final_progress_tx.send(ScanEvent::Finished);
                             ready_for_scan.store(true, Ordering::SeqCst);
+                            drop(final_progress_tx);
+                            let _ = progress_thread.join();
                             info!("daemon: initial index build completed");
                         }
                         Ok(Err(err)) => {
+                            let _ = final_progress_tx.send(ScanEvent::Failed);
+                            drop(final_progress_tx);
+                            let _ = progress_thread.join();
                             error!("daemon: initial index build failed: {err}");
                         }
                         Err(join_err) => {
+                            let _ = final_progress_tx.send(ScanEvent::Failed);
+                            drop(final_progress_tx);
+                            let _ = progress_thread.join();
                             error!("daemon: initial index task panicked: {join_err}");
                         }
                     }
@@ -487,6 +541,9 @@ pub fn daemon_status(db_path: &Path) -> Result<Option<DaemonInfo>, Box<dyn std::
         .and_then(|s| s.parse::<u32>().ok());
     let version = index.get_meta(meta_keys::DAEMON_VERSION)?;
     let idx_status = index.get_meta(meta_keys::INDEX_STATUS)?;
+    let progress = index
+        .get_meta(meta_keys::INDEX_PROGRESS)?
+        .and_then(|json| serde_json::from_str(&json).ok());
 
     if leader_info.is_none() && pid.is_none() {
         return Ok(None);
@@ -501,6 +558,7 @@ pub fn daemon_status(db_path: &Path) -> Result<Option<DaemonInfo>, Box<dyn std::
         pid,
         version,
         index_status: idx_status,
+        progress,
         leader_holder: leader_info.as_ref().map(|(h, _)| h.clone()),
         leader_expires_ms: leader_info.map(|(_, e)| e),
     }))

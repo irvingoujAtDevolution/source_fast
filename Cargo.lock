@@ -2664,6 +2664,7 @@ dependencies = [
  "serde_json",
  "source_fast_core",
  "source_fast_fs",
+ "source_fast_progress",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2694,9 +2695,17 @@ dependencies = [
  "notify",
  "rayon",
  "source_fast_core",
+ "source_fast_progress",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "source_fast_progress"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

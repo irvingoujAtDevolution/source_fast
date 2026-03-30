@@ -8,6 +8,7 @@ use gix::bstr::ByteSlice;
 use gix::object::tree::diff::ChangeDetached;
 use ignore::{WalkBuilder, WalkState};
 use source_fast_core::{IndexError, PersistentIndex};
+use source_fast_progress::{ScanEvent, ScanMode, ScanPlan};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy)]
@@ -45,11 +46,19 @@ fn estimate_seconds(files: usize, bytes: u64) -> f64 {
 /// - If `git_head` differs and the old commit can be found, apply a tree diff
 ///   between the old and new HEAD trees and only touch changed paths.
 pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexError> {
+    smart_scan_with_progress(root, index, Arc::new(|_| {}))
+}
+
+pub fn smart_scan_with_progress(
+    root: &Path,
+    index: Arc<PersistentIndex>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+) -> Result<(), IndexError> {
     let repo = match gix::discover(root) {
         Ok(repo) => repo,
         Err(err) => {
             debug!("smart_scan: no git repository detected: {err}, falling back to full scan");
-            return initial_scan(root, index);
+            return initial_scan_with_progress(root, index, progress);
         }
     };
 
@@ -57,7 +66,7 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
         Ok(commit) => commit,
         Err(err) => {
             debug!("smart_scan: failed to read git HEAD commit: {err}, falling back to full scan");
-            return initial_scan(root, index);
+            return initial_scan_with_progress(root, index, progress);
         }
     };
 
@@ -106,7 +115,7 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
                 Err(err) => {
                     warn!("smart_scan: incremental diff failed: {err}, falling back to full scan");
                     // Fallback: full scan, then store current HEAD.
-                    initial_scan(root, Arc::clone(&index))?;
+                    initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
                     if let Err(err) = index.set_meta("git_head", &current_str) {
                         warn!("smart_scan: failed to store git_head in meta: {err}");
                     } else {
@@ -118,12 +127,24 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
         }
         None => {
             info!("smart_scan: no git_head stored in index yet (first run?)");
-            initial_git_scan(root, &workdir, Arc::clone(&index), &current_str)?;
+            initial_git_scan_with_progress(
+                root,
+                &workdir,
+                Arc::clone(&index),
+                &current_str,
+                Arc::clone(&progress),
+            )?;
             return Ok(());
         }
     }
 
     if candidates.is_empty() {
+        progress(ScanEvent::Started(ScanPlan {
+            mode: ScanMode::Incremental,
+            total_files: 0,
+            total_bytes: 0,
+        }));
+        progress(ScanEvent::Finished);
         debug!("smart_scan: no incremental candidates to process");
         // Even if there were no changes, make sure the HEAD checkpoint is up to date.
         if let Err(err) = index.set_meta("git_head", &current_str) {
@@ -132,7 +153,14 @@ pub fn smart_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexE
         return Ok(());
     }
 
-    apply_changes_by_files(root, &index, candidates)?;
+    let (candidate_files, candidate_bytes) = count_candidates(root, candidates.clone());
+    progress(ScanEvent::Started(ScanPlan {
+        mode: ScanMode::Incremental,
+        total_files: candidate_files,
+        total_bytes: candidate_bytes,
+    }));
+    apply_changes_by_files_with_progress(root, &index, candidates, Arc::clone(&progress))?;
+    progress(ScanEvent::Finished);
 
     if let Err(err) = index.set_meta("git_head", &current_str) {
         warn!("smart_scan: failed to store git_head in meta: {err}");
@@ -537,11 +565,12 @@ fn count_candidates(root: &Path, candidates: HashSet<PathBuf>) -> (usize, u64) {
     (files, bytes)
 }
 
-fn initial_git_scan(
+fn initial_git_scan_with_progress(
     root: &Path,
     workdir: &Path,
     index: Arc<PersistentIndex>,
     current_head: &str,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
 ) -> Result<(), IndexError> {
     info!(
         "initial_git_scan: starting gix-based scan at {}",
@@ -554,7 +583,7 @@ fn initial_git_scan(
             warn!(
                 "initial_git_scan: failed to open repository: {err} – falling back to full walk"
             );
-            initial_scan(root, Arc::clone(&index))?;
+            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
             } else {
@@ -580,7 +609,7 @@ fn initial_git_scan(
             warn!(
                 "initial_git_scan: failed to read git index: {err} – falling back to full walk"
             );
-            initial_scan(root, Arc::clone(&index))?;
+            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
             } else {
@@ -609,7 +638,14 @@ fn initial_git_scan(
         }
     }
 
-    apply_changes_by_files(root, &index, candidates)?;
+    let (candidate_files, candidate_bytes) = count_candidates(root, candidates.clone());
+    progress(ScanEvent::Started(ScanPlan {
+        mode: ScanMode::GitInitial,
+        total_files: candidate_files,
+        total_bytes: candidate_bytes,
+    }));
+    apply_changes_by_files_with_progress(root, &index, candidates, Arc::clone(&progress))?;
+    progress(ScanEvent::Finished);
 
     if let Err(err) = index.set_meta("git_head", current_head) {
         warn!("smart_scan: failed to store git_head in meta: {err}");
@@ -620,10 +656,11 @@ fn initial_git_scan(
     Ok(())
 }
 
-fn apply_changes_by_files(
+fn apply_changes_by_files_with_progress(
     root: &Path,
     index: &PersistentIndex,
     files: impl IntoIterator<Item = PathBuf>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
 ) -> Result<(), IndexError> {
     let exclude_dir = root.join(".source_fast");
     let git_dir = root.join(".git");
@@ -645,11 +682,17 @@ fn apply_changes_by_files(
             if !path.is_file() {
                 continue;
             }
+            let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+            progress(ScanEvent::FileStarted(path.display().to_string()));
             if let Err(err) = index.index_path(&path) {
                 warn!("smart_scan: failed to index path {}: {err}", path.display());
             } else {
                 changed += 1;
             }
+            progress(ScanEvent::FileFinished {
+                path: path.display().to_string(),
+                bytes,
+            });
         } else if let Err(err) = index.remove_path(&path) {
             warn!(
                 "smart_scan: failed to remove path {} from index: {err}",
@@ -657,6 +700,10 @@ fn apply_changes_by_files(
             );
         } else {
             changed += 1;
+            progress(ScanEvent::FileFinished {
+                path: path.display().to_string(),
+                bytes: 0,
+            });
         }
     }
 
@@ -678,11 +725,27 @@ fn apply_changes_by_files(
 /// This is the current behaviour: walk the tree in parallel, index every file,
 /// and flush at the end.
 pub fn initial_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), IndexError> {
+    initial_scan_with_progress(root, index, Arc::new(|_| {}))
+}
+
+fn initial_scan_with_progress(
+    root: &Path,
+    index: Arc<PersistentIndex>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+) -> Result<(), IndexError> {
     info!("initial_scan: starting parallel walk at {}", root.display());
+
+    let (total_files, total_bytes) = count_full_scan(root)?;
+    progress(ScanEvent::Started(ScanPlan {
+        mode: ScanMode::FullScan,
+        total_files,
+        total_bytes,
+    }));
 
     let counter = Arc::new(AtomicUsize::new(0));
     let index_for_scan = Arc::clone(&index);
     let counter_for_scan = Arc::clone(&counter);
+    let progress_for_scan = Arc::clone(&progress);
 
     let exclude_dir = root.join(".source_fast");
     let walker = WalkBuilder::new(root)
@@ -708,6 +771,7 @@ pub fn initial_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), Inde
     walker.run(|| {
         let index = Arc::clone(&index_for_scan);
         let counter = Arc::clone(&counter_for_scan);
+        let progress = Arc::clone(&progress_for_scan);
 
         Box::new(move |entry_res| {
             let entry = match entry_res {
@@ -722,18 +786,26 @@ pub fn initial_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), Inde
                 return WalkState::Continue;
             }
 
+            let path = entry.path().to_path_buf();
+            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            progress(ScanEvent::FileStarted(path.display().to_string()));
+
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if done.is_multiple_of(500) {
                 info!("initial_scan: indexed {} files so far", done);
             }
 
-            if let Err(err) = index.index_path(entry.path()) {
+            if let Err(err) = index.index_path(&path) {
                 warn!(
                     "initial_scan worker: failed to index {}: {:?}",
-                    entry.path().display(),
+                    path.display(),
                     err
                 );
             }
+            progress(ScanEvent::FileFinished {
+                path: path.display().to_string(),
+                bytes,
+            });
 
             WalkState::Continue
         })
@@ -743,6 +815,7 @@ pub fn initial_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<(), Inde
     index.flush()?;
     let done = counter.load(Ordering::Relaxed);
     info!("initial_scan: completed, indexed {} files in total", done);
+    progress(ScanEvent::Finished);
     Ok(())
 }
 

@@ -1,0 +1,9 @@
+[package]
+name = "source_fast_progress"
+version = "0.1.0"
+edition = "2024"
+description = "Progress events and status snapshots for source_fast indexing"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

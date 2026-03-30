@@ -125,3 +125,39 @@ fn test_search_file_by_path() {
         stdout
     );
 }
+
+#[test]
+fn test_daemon_and_index_status_commands() {
+    let fix = TestFixture::new();
+    fix.add_file("src/main.rs", "fn main() { println!(\"hello\"); }");
+    fix.add_file("src/lib.rs", "pub fn status_probe() {}");
+
+    let _ = fix.search("status_probe");
+
+    fix.sf()
+        .arg("daemon")
+        .arg("status")
+        .arg("--root")
+        .arg(fix.root())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PID:"));
+
+    fix.sf()
+        .arg("deamon")
+        .arg("status")
+        .arg("--root")
+        .arg(fix.root())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PID:"));
+
+    fix.sf()
+        .arg("index")
+        .arg("status")
+        .arg("--root")
+        .arg(fix.root())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Index status:"));
+}

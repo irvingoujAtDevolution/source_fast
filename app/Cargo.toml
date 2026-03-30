@@ -21,6 +21,7 @@ rmcp = { version = "0.10", features = ["server", "transport-io", "macros"] }
 schemars = "1.1"
 source_fast_core = { path = "../core" }
 source_fast_fs = { path = "../fs" }
+source_fast_progress = { path = "../progress" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.11"

@@ -6,6 +6,7 @@ use source_fast_core::{
     IndexError, PersistentIndex, rewrite_root_paths, search_database_file_with_snippets_filtered,
     search_files_in_database,
 };
+use source_fast_progress::IndexProgress;
 use tracing::{error, warn};
 
 use crate::daemon;
@@ -362,6 +363,63 @@ pub async fn run_file_search_with_daemon(
 // Management commands
 // ---------------------------------------------------------------------------
 
+fn format_eta(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+
+    let minutes = seconds / 60;
+    let secs = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {secs}s");
+    }
+
+    let hours = minutes / 60;
+    let mins = minutes % 60;
+    format!("{hours}h {mins}m")
+}
+
+fn estimate_eta_seconds(progress: &IndexProgress) -> Option<u64> {
+    let started_at_ms = progress.started_at_ms?;
+    let elapsed_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .saturating_sub(started_at_ms as u128) as u64;
+
+    let total_bytes = progress.total_bytes?;
+    if total_bytes > 0 && progress.processed_bytes > 0 && progress.processed_bytes < total_bytes {
+        let remaining_bytes = total_bytes.saturating_sub(progress.processed_bytes);
+        let eta_ms = elapsed_ms
+            .saturating_mul(remaining_bytes)
+            .checked_div(progress.processed_bytes)?;
+        return Some((eta_ms / 1000).max(1));
+    }
+
+    let total_files = progress.total_files?;
+    if total_files > 0 && progress.processed_files > 0 && progress.processed_files < total_files {
+        let remaining_files = total_files.saturating_sub(progress.processed_files);
+        let eta_ms = elapsed_ms
+            .saturating_mul(remaining_files as u64)
+            .checked_div(progress.processed_files as u64)?;
+        return Some((eta_ms / 1000).max(1));
+    }
+
+    None
+}
+
+fn format_remaining_lease(expires_at_ms: i64) -> Option<String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+    if remaining_ms <= 0 {
+        return Some("expired".to_string());
+    }
+    Some(format_eta((remaining_ms as u64).div_ceil(1000)))
+}
+
 pub async fn run_stop(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
@@ -413,10 +471,42 @@ pub async fn run_status(
                 "Index status: {}",
                 info.index_status.unwrap_or_else(|| "unknown".to_string())
             );
+            if let Some(progress) = info.progress {
+                if let Some(mode) = progress.mode.as_deref() {
+                    println!("Scan mode:    {mode}");
+                }
+                match progress.total_files {
+                    Some(total) => {
+                        println!(
+                            "Progress:     {}/{} files",
+                            progress.processed_files, total
+                        );
+                    }
+                    None => {
+                        println!("Progress:     {} files", progress.processed_files);
+                    }
+                }
+                if let Some(current) = progress.current_path.as_deref() {
+                    println!("Processing:   {current}");
+                }
+                if let Some(last) = progress.last_completed_path.as_deref() {
+                    println!("Last file:    {last}");
+                }
+                if progress.phase == "complete" {
+                    println!("ETA:          done");
+                } else if let Some(eta) = estimate_eta_seconds(&progress) {
+                    println!("ETA:          {}", format_eta(eta));
+                }
+            }
             println!(
                 "Leader:       {}",
                 info.leader_holder.unwrap_or_else(|| "none".to_string())
             );
+            if let Some(expires_at_ms) = info.leader_expires_ms {
+                if let Some(remaining) = format_remaining_lease(expires_at_ms) {
+                    println!("Lease TTL:    {remaining}");
+                }
+            }
         }
         None => {
             println!("No daemon running for {}", root.display());

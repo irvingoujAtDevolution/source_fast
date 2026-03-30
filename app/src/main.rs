@@ -14,6 +14,43 @@ use crate::cli::{
 use crate::mcp::run_server;
 
 #[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Show daemon and index status for this repository.
+    Status {
+        /// Root directory
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to database file
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Stop the daemon for this repository.
+    Stop {
+        /// Root directory
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to database file
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// List all running daemons.
+    List,
+}
+
+#[derive(Subcommand, Debug)]
+enum IndexCommand {
+    /// Show index build status for this repository.
+    Status {
+        /// Root directory
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to database file
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Search code content. Auto-starts a background daemon if not running.
     Search {
@@ -58,7 +95,8 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Show daemon and index status for this repository.
+    /// Show daemon and index status for this repository, including scan progress and ETA.
+    #[command(visible_aliases = ["index-status", "daemon-status"])]
     Status {
         /// Root directory
         #[arg(long)]
@@ -66,6 +104,17 @@ enum Command {
         /// Path to database file
         #[arg(long)]
         db: Option<PathBuf>,
+    },
+    /// Daemon management commands.
+    #[command(visible_alias = "deamon")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    /// Index management commands.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     /// List all running daemons.
     List,
@@ -80,7 +129,7 @@ enum Command {
     },
     /// Internal: daemon process (not user-facing).
     #[command(name = "_daemon", hide = true)]
-    Daemon {
+    InternalDaemon {
         /// Root directory to index and watch
         #[arg(long)]
         root: Option<PathBuf>,
@@ -138,6 +187,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing_cli();
             run_status(root, db).await?;
         }
+        Command::Daemon { command } => {
+            init_tracing_cli();
+            match command {
+                DaemonCommand::Status { root, db } => run_status(root, db).await?,
+                DaemonCommand::Stop { root, db } => run_stop(root, db).await?,
+                DaemonCommand::List => run_list().await?,
+            }
+        }
+        Command::Index { command } => {
+            init_tracing_cli();
+            match command {
+                IndexCommand::Status { root, db } => run_status(root, db).await?,
+            }
+        }
         Command::List => {
             init_tracing_cli();
             run_list().await?;
@@ -146,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing_server();
             run_server(root, db).await?;
         }
-        Command::Daemon { root, db } => {
+        Command::InternalDaemon { root, db } => {
             // Tracing is initialized inside run_daemon (goes to daemon.log).
             let root = root.unwrap_or_else(default_root);
             let db_path = db.unwrap_or_else(|| default_db_path(&root));
