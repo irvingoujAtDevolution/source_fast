@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gix::Repository;
 use gix::bstr::ByteSlice;
 use gix::object::tree::diff::ChangeDetached;
-use ignore::{WalkBuilder, WalkState};
+use ignore::WalkBuilder;
+use rayon::prelude::*;
 use source_fast_core::{IndexError, PersistentIndex};
 use source_fast_progress::{ScanEvent, ScanMode, ScanPlan};
 use tracing::{debug, info, warn};
@@ -534,6 +535,50 @@ fn count_full_scan(root: &Path) -> Result<(usize, u64), IndexError> {
     Ok((files, bytes))
 }
 
+fn collect_full_scan_entries(root: &Path) -> Result<Vec<(PathBuf, u64)>, IndexError> {
+    let exclude_dir = root.join(".source_fast");
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            if path.starts_with(&exclude_dir) {
+                return false;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name == ".git"
+            {
+                return false;
+            }
+            true
+        })
+        .build();
+
+    let mut entries = Vec::new();
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                warn!("collect_full_scan_entries: failed to read entry: {err}");
+                continue;
+            }
+        };
+
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        entries.push((entry.path().to_path_buf(), bytes));
+    }
+
+    Ok(entries)
+}
+
 fn count_candidates(root: &Path, candidates: HashSet<PathBuf>) -> (usize, u64) {
     let exclude_dir = root.join(".source_fast");
     let git_dir = root.join(".git");
@@ -735,7 +780,11 @@ fn initial_scan_with_progress(
 ) -> Result<(), IndexError> {
     info!("initial_scan: starting parallel walk at {}", root.display());
 
-    let (total_files, total_bytes) = count_full_scan(root)?;
+    let entries = collect_full_scan_entries(root)?;
+    let total_files = entries.len();
+    let total_bytes = entries
+        .iter()
+        .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
     progress(ScanEvent::Started(ScanPlan {
         mode: ScanMode::FullScan,
         total_files,
@@ -747,68 +796,29 @@ fn initial_scan_with_progress(
     let counter_for_scan = Arc::clone(&counter);
     let progress_for_scan = Arc::clone(&progress);
 
-    let exclude_dir = root.join(".source_fast");
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(true)
-        .filter_entry(move |entry| {
-            let path = entry.path();
-            if path.starts_with(&exclude_dir) {
-                return false;
-            }
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name == ".git"
-            {
-                return false;
-            }
-            true
-        })
-        .build_parallel();
-
-    walker.run(|| {
+    entries.into_par_iter().for_each(|(path, bytes)| {
         let index = Arc::clone(&index_for_scan);
         let counter = Arc::clone(&counter_for_scan);
         let progress = Arc::clone(&progress_for_scan);
 
-        Box::new(move |entry_res| {
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(err) => {
-                    warn!("initial_scan: failed to read entry: {err}");
-                    return WalkState::Continue;
-                }
-            };
+        progress(ScanEvent::FileStarted(path.display().to_string()));
 
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                return WalkState::Continue;
-            }
+        let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if done.is_multiple_of(500) {
+            info!("initial_scan: indexed {} files so far", done);
+        }
 
-            let path = entry.path().to_path_buf();
-            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            progress(ScanEvent::FileStarted(path.display().to_string()));
-
-            let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if done.is_multiple_of(500) {
-                info!("initial_scan: indexed {} files so far", done);
-            }
-
-            if let Err(err) = index.index_path(&path) {
-                warn!(
-                    "initial_scan worker: failed to index {}: {:?}",
-                    path.display(),
-                    err
-                );
-            }
-            progress(ScanEvent::FileFinished {
-                path: path.display().to_string(),
-                bytes,
-            });
-
-            WalkState::Continue
-        })
+        if let Err(err) = index.index_path(&path) {
+            warn!(
+                "initial_scan worker: failed to index {}: {:?}",
+                path.display(),
+                err
+            );
+        }
+        progress(ScanEvent::FileFinished {
+            path: path.display().to_string(),
+            bytes,
+        });
     });
 
     debug!("initial_scan: parallel walk finished, flushing index");

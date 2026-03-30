@@ -368,6 +368,35 @@ fn ensure_trailing_separator(path: &str) -> String {
     }
 }
 
+fn diff_sorted_trigrams(old: &[[u8; 3]], new: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut old_idx = 0usize;
+    let mut new_idx = 0usize;
+
+    while old_idx < old.len() && new_idx < new.len() {
+        match old[old_idx].cmp(&new[new_idx]) {
+            std::cmp::Ordering::Less => {
+                removed.push(old[old_idx]);
+                old_idx += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                old_idx += 1;
+                new_idx += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                added.push(new[new_idx]);
+                new_idx += 1;
+            }
+        }
+    }
+
+    removed.extend_from_slice(&old[old_idx..]);
+    added.extend_from_slice(&new[new_idx..]);
+
+    (removed, added)
+}
+
 pub fn rewrite_root_paths(
     db_path: &Path,
     old_root: &Path,
@@ -467,12 +496,19 @@ fn upsert_file<'conn>(
         )
         .optional()?;
 
-    if let Some(blob) = old_trigrams_blob {
-        let config = config::standard();
-        let (old_trigrams, _) =
-            bincode::serde::decode_from_slice::<Vec<[u8; 3]>, _>(&blob, config)?;
+    let (removed_trigrams, added_trigrams, needs_file_trigram_write) =
+        if let Some(blob) = old_trigrams_blob {
+            let config = config::standard();
+            let (old_trigrams, _) =
+                bincode::serde::decode_from_slice::<Vec<[u8; 3]>, _>(&blob, config)?;
+            let (removed, added) = diff_sorted_trigrams(&old_trigrams, trigrams);
+            let needs_write = !(removed.is_empty() && added.is_empty());
+            (removed, added, needs_write)
+        } else {
+            (Vec::new(), trigrams.to_vec(), true)
+        };
 
-        for trigram in old_trigrams {
+    for trigram in removed_trigrams {
             let key = trigram;
 
             let bitmap_blob_opt: Option<Vec<u8>> = tx
@@ -500,17 +536,18 @@ fn upsert_file<'conn>(
                 }
             }
         }
+
+    if needs_file_trigram_write {
+        let config = config::standard();
+        let encoded_trigrams = bincode::serde::encode_to_vec(trigrams, config)?;
+        tx.execute(
+            "INSERT INTO file_trigrams (file_id, trigrams) VALUES (?1, ?2)
+             ON CONFLICT(file_id) DO UPDATE SET trigrams = excluded.trigrams",
+            params![file_id as i64, encoded_trigrams],
+        )?;
     }
 
-    let config = config::standard();
-    let encoded_trigrams = bincode::serde::encode_to_vec(trigrams, config)?;
-    tx.execute(
-        "INSERT INTO file_trigrams (file_id, trigrams) VALUES (?1, ?2)
-         ON CONFLICT(file_id) DO UPDATE SET trigrams = excluded.trigrams",
-        params![file_id as i64, encoded_trigrams],
-    )?;
-
-    for trigram in trigrams {
+    for trigram in added_trigrams {
         let key = trigram;
 
         let bitmap_blob_opt: Option<Vec<u8>> = tx

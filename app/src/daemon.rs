@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use source_fast_core::PersistentIndex;
@@ -96,6 +96,77 @@ fn now_ms() -> u64 {
 fn persist_progress(index: &PersistentIndex, progress: &IndexProgress) {
     if let Ok(json) = serde_json::to_string(progress) {
         let _ = index.set_meta(meta_keys::INDEX_PROGRESS, &json);
+    }
+}
+
+fn open_meta_conn(db_path: &Path) -> Option<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    Some(conn)
+}
+
+fn write_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+struct ProgressWriter {
+    db_path: PathBuf,
+    conn: Option<rusqlite::Connection>,
+    last_json: Option<String>,
+    last_persist_at: Option<Instant>,
+}
+
+impl ProgressWriter {
+    const MIN_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
+
+    fn new(db_path: &Path) -> Self {
+        Self {
+            db_path: db_path.to_path_buf(),
+            conn: open_meta_conn(db_path),
+            last_json: None,
+            last_persist_at: None,
+        }
+    }
+
+    fn persist(&mut self, progress: &IndexProgress, force: bool) {
+        let Ok(json) = serde_json::to_string(progress) else {
+            return;
+        };
+
+        if !force {
+            if self.last_json.as_deref() == Some(json.as_str()) {
+                return;
+            }
+            if let Some(last_persist_at) = self.last_persist_at
+                && last_persist_at.elapsed() < Self::MIN_PERSIST_INTERVAL
+            {
+                return;
+            }
+        }
+
+        if self.try_write(&json).is_some() {
+            self.last_json = Some(json);
+            self.last_persist_at = Some(Instant::now());
+        }
+    }
+
+    fn try_write(&mut self, json: &str) -> Option<()> {
+        if let Some(conn) = self.conn.as_ref()
+            && write_meta(conn, meta_keys::INDEX_PROGRESS, json).is_ok()
+        {
+            return Some(());
+        }
+
+        self.conn = open_meta_conn(&self.db_path);
+        let conn = self.conn.as_ref()?;
+        write_meta(conn, meta_keys::INDEX_PROGRESS, json).ok()?;
+        Some(())
     }
 }
 
@@ -194,18 +265,20 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                     let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
                     let progress_thread = std::thread::spawn(move || {
                         let mut progress = IndexProgress::building(now_ms());
-                        persist_progress(&index_for_progress, &progress);
+                        let mut progress_writer = ProgressWriter::new(index_for_progress.db_path());
+                        progress_writer.persist(&progress, true);
                         loop {
                             match progress_rx.recv_timeout(Duration::from_millis(500)) {
                                 Ok(event) => {
+                                    let force = matches!(event, ScanEvent::Finished | ScanEvent::Failed);
                                     progress.apply_event(event, now_ms());
-                                    persist_progress(&index_for_progress, &progress);
+                                    progress_writer.persist(&progress, force);
                                 }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                                    persist_progress(&index_for_progress, &progress);
+                                    progress_writer.persist(&progress, false);
                                 }
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                    persist_progress(&index_for_progress, &progress);
+                                    progress_writer.persist(&progress, true);
                                     break;
                                 }
                             }
@@ -426,7 +499,6 @@ pub fn ensure_daemon(root: &Path, db_path: &Path) -> Result<bool, Box<dyn std::e
                 "daemon version mismatch, restarting"
             );
             let _ = stop_daemon(db_path);
-            // Wait for the old daemon to pick up the shutdown request.
             std::thread::sleep(Duration::from_secs(2));
         }
     }

@@ -1,26 +1,20 @@
 use std::collections::{HashSet, VecDeque};
-use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::Snippet;
 
-fn is_binary_file(path: &Path) -> std::io::Result<bool> {
-    let mut f = std::fs::File::open(path)?;
-    let mut buf = [0u8; 1024];
-    let read = f.read(&mut buf)?;
-    Ok(buf[..read].contains(&0))
-}
-
 pub fn read_text_file(path: &Path) -> std::io::Result<Option<String>> {
-    if is_binary_file(path)? {
+    let bytes = std::fs::read(path)?;
+    let sniff_len = bytes.len().min(1024);
+
+    if bytes[..sniff_len].contains(&0) {
         return Ok(None);
     }
 
-    match std::fs::read_to_string(path) {
+    match String::from_utf8(bytes) {
         Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(None),
-        Err(e) => Err(e),
+        Err(_) => Ok(None),
     }
 }
 
