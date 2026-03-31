@@ -303,25 +303,52 @@ fn print_watch_summary(snapshot: &WatchSnapshot) {
 }
 
 fn watch_progress_polling(db_path: &Path) {
-    let poll_interval = Duration::from_millis(100);
+    use source_fast_core::storage::open_readonly_env;
+
+    let poll_interval = Duration::from_millis(50);
     let mut last_line_len = 0usize;
 
-    loop {
-        let status = read_meta_readonly(db_path, daemon::meta_keys::INDEX_STATUS)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+    // Open the LMDB env once and reuse it for all polls.
+    // This avoids re-mapping 1 GB of virtual memory and re-acquiring the
+    // write lock to open named databases on every iteration.
+    let env_and_dbs = open_readonly_env(db_path);
+    let (env, dbs) = match env_and_dbs {
+        Ok(ed) => ed,
+        Err(_) => {
+            eprintln!("No index is being built.");
+            return;
+        }
+    };
 
-        let progress = read_meta_readonly(db_path, daemon::meta_keys::INDEX_PROGRESS)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<IndexProgress>(&json).ok());
+    loop {
+        let (status, progress) = {
+            let Ok(rtxn) = env.read_txn() else {
+                std::thread::sleep(poll_interval);
+                continue;
+            };
+            let status = dbs
+                .meta
+                .get(&rtxn, daemon::meta_keys::INDEX_STATUS)
+                .ok()
+                .flatten()
+                .map(str::to_string)
+                .unwrap_or_default();
+            let progress = dbs
+                .meta
+                .get(&rtxn, daemon::meta_keys::INDEX_PROGRESS)
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<IndexProgress>(json).ok());
+            drop(rtxn);
+            (status, progress)
+        };
 
         let line = match &progress {
             Some(p) => format_progress_line(p, &status),
             None if status == "complete" => "\x1b[32m✓ Index complete.\x1b[0m".to_string(),
             None if status == "failed" => "\x1b[31m✗ Index build failed.\x1b[0m".to_string(),
-            None => "Waiting for daemon...".to_string(),
+            _ if status.is_empty() || status == "building" => "Waiting for daemon...".to_string(),
+            None => "No index is being built.".to_string(),
         };
 
         let padding = if line.len() < last_line_len {

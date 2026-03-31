@@ -54,12 +54,13 @@ struct FileIdState {
 }
 
 #[derive(Clone)]
-struct DbHandles {
+pub struct DbHandles {
     files: FilesDb,
     files_by_path: FilesByPathDb,
     trigrams: TrigramsDb,
     file_trigrams: FileTrigramsDb,
-    meta: MetaDb,
+    /// Publicly accessible for direct polling by `sf index watch`.
+    pub meta: MetaDb,
     leader: LeaderDb,
 }
 
@@ -645,7 +646,7 @@ fn load_file_id_state(env: &Env, dbs: &DbHandles) -> IndexResult<FileIdState> {
 /// Open the LMDB environment for read-only access. Only read transactions
 /// should be created on this env. In cross-process scenarios (CLI reading
 /// while daemon writes), LMDB handles concurrent access via MVCC.
-fn open_readonly_env(path: &Path) -> IndexResult<(Env, DbHandles)> {
+pub fn open_readonly_env(path: &Path) -> IndexResult<(Env, DbHandles)> {
     let env = open_env(path)?;
     // LMDB requires a write transaction to open named databases for the first
     // time in a given env handle (mdb_dbi_open with named DBs needs MDB_CREATE
