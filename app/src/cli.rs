@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use source_fast_core::{
-    IndexError, PersistentIndex, read_meta_readonly, rewrite_root_paths,
-    search_database_file_with_snippets_filtered, search_files_in_database,
+    IndexError, PersistentIndex, extract_snippet, read_meta_readonly, rewrite_root_paths,
+    search_database_file_filtered, search_files_in_database,
 };
 use source_fast_progress::IndexProgress;
 use tracing::{debug, error, info, warn};
@@ -364,68 +364,77 @@ pub async fn run_search_with_daemon(
         }
     }
 
-    // Execute the search.
-    let results =
-        match search_database_file_with_snippets_filtered(&db_path, &query, file_regex.as_ref()) {
-            Ok(r) => r,
-            Err(err) => {
-                error!(db = %db_path.display(), query = %query, error = ?err, "search command failed");
-                std::process::exit(1);
-            }
-        };
-
-    info!(
-        db = %db_path.display(),
-        query = %query,
-        results = results.len(),
-        elapsed_ms = command_started.elapsed().as_millis() as u64,
-        "search command completed"
-    );
-
-    // Sort: results with snippets first, then by path.
-    let mut with_snippet = Vec::new();
-    let mut without_snippet = Vec::new();
-    for result in results {
-        if result.snippet.is_some() {
-            with_snippet.push(result);
-        } else {
-            without_snippet.push(result);
+    // Get trigram search hits (fast — bitmap intersection only, no file I/O).
+    let mut hits = match search_database_file_filtered(&db_path, &query, file_regex.as_ref()) {
+        Ok(h) => h,
+        Err(err) => {
+            error!(db = %db_path.display(), query = %query, error = ?err, "search command failed");
+            std::process::exit(1);
         }
-    }
-    with_snippet.sort_by(|a, b| a.path.cmp(&b.path));
-    without_snippet.sort_by(|a, b| a.path.cmp(&b.path));
+    };
+    hits.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let total = with_snippet.len() + without_snippet.len();
-    let all_results: Vec<_> = with_snippet.iter().chain(without_snippet.iter()).collect();
-    let display_count = if limit > 0 { limit.min(total) } else { total };
+    let total = hits.len();
+    let display_limit = if limit > 0 { limit } else { total };
 
-    for result in &all_results[..display_count] {
-        match &result.snippet {
+    // Stream results using a channel: rayon workers extract snippets in parallel
+    // and send results through a channel. The main thread prints as they arrive.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<source_fast_core::Snippet>)>(32);
+
+    let query_for_workers = query.clone();
+    std::thread::spawn(move || {
+        use rayon::prelude::*;
+        hits.par_iter().for_each(|hit| {
+            let path = PathBuf::from(&hit.path);
+            let snippet = extract_snippet(&path, &query_for_workers)
+                .ok()
+                .flatten();
+            // Ignore send errors — receiver may have stopped early (limit reached).
+            let _ = tx.send((hit.path.clone(), snippet));
+        });
+    });
+
+    let mut printed = 0usize;
+    let mut no_snippet_paths: Vec<String> = Vec::new();
+
+    for (path, snippet) in rx {
+        match snippet {
             Some(snippet) => {
-                let path_str = snippet.path.display().to_string();
-                let display_path = clean_display_path(&path_str);
-                println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
-                for (line_no, line) in &snippet.lines {
-                    let truncated = truncate_line(line, 200);
-                    if line.contains(&query) {
-                        println!("\x1b[32m{line_no}\x1b[0m:{truncated}");
-                    } else {
-                        println!("\x1b[2m{line_no}\x1b[0m:{truncated}");
+                if printed < display_limit {
+                    let path_str = snippet.path.display().to_string();
+                    let display_path = clean_display_path(&path_str);
+                    println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
+                    for (line_no, line) in &snippet.lines {
+                        let truncated = truncate_line(line, 200);
+                        if line.contains(&query) {
+                            println!("\x1b[32m{line_no}\x1b[0m:{truncated}");
+                        } else {
+                            println!("\x1b[2m{line_no}\x1b[0m:{truncated}");
+                        }
                     }
+                    println!();
+                    printed += 1;
                 }
-                println!();
             }
             None => {
-                let display_path = clean_display_path(&result.path);
-                println!("{display_path}");
+                no_snippet_paths.push(path);
             }
         }
     }
 
-    if limit > 0 && total > limit {
+    // Print remaining no-snippet results at the end (up to the limit).
+    for path in &no_snippet_paths {
+        if printed >= display_limit {
+            break;
+        }
+        println!("{}", clean_display_path(path));
+        printed += 1;
+    }
+
+    if total > display_limit {
         eprintln!(
             "... and {} more results (use --limit 0 for all)",
-            total - limit
+            total - display_limit
         );
     }
 

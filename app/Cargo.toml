@@ -29,6 +29,7 @@ regex = "1.11"
 dirs = "6"
 fd-lock = "4"
 heed = "0.20"
+rayon = "1.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

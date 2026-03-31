@@ -2770,6 +2770,7 @@ dependencies = [
  "insta",
  "libc",
  "predicates",
+ "rayon",
  "regex",
  "rmcp",
  "schemars",
