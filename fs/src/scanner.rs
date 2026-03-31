@@ -172,10 +172,7 @@ pub fn smart_scan_with_progress(
     Ok(())
 }
 
-pub fn dry_run_scan(
-    root: &Path,
-    index: Arc<PersistentIndex>,
-) -> Result<DryRunInfo, IndexError> {
+pub fn dry_run_scan(root: &Path, index: Arc<PersistentIndex>) -> Result<DryRunInfo, IndexError> {
     let repo = match gix::discover(root) {
         Ok(repo) => repo,
         Err(err) => {
@@ -229,26 +226,27 @@ pub fn dry_run_scan(
             candidates.extend(worktree_paths);
             DryRunMode::Incremental
         }
-        Some(ref stored) => match collect_head_diff_candidates(&repo, &workdir, stored, &current_str)
-        {
-            Ok(diff_paths) => {
-                candidates.extend(diff_paths);
-                let worktree_paths = collect_worktree_candidates(&repo, &workdir)?;
-                candidates.extend(worktree_paths);
-                DryRunMode::Incremental
+        Some(ref stored) => {
+            match collect_head_diff_candidates(&repo, &workdir, stored, &current_str) {
+                Ok(diff_paths) => {
+                    candidates.extend(diff_paths);
+                    let worktree_paths = collect_worktree_candidates(&repo, &workdir)?;
+                    candidates.extend(worktree_paths);
+                    DryRunMode::Incremental
+                }
+                Err(err) => {
+                    warn!("dry_run_scan: incremental diff failed: {err}");
+                    let (files, bytes) = count_full_scan(root)?;
+                    let estimated = estimate_seconds(files, bytes);
+                    return Ok(DryRunInfo {
+                        mode: DryRunMode::FullScan,
+                        candidate_files: files,
+                        candidate_bytes: bytes,
+                        estimated_seconds: estimated,
+                    });
+                }
             }
-            Err(err) => {
-                warn!("dry_run_scan: incremental diff failed: {err}");
-                let (files, bytes) = count_full_scan(root)?;
-                let estimated = estimate_seconds(files, bytes);
-                return Ok(DryRunInfo {
-                    mode: DryRunMode::FullScan,
-                    candidate_files: files,
-                    candidate_bytes: bytes,
-                    estimated_seconds: estimated,
-                });
-            }
-        },
+        }
         None => {
             let index_candidates = collect_index_candidates(&repo, &workdir)?;
             candidates.extend(index_candidates);
@@ -625,9 +623,7 @@ fn initial_git_scan_with_progress(
     let repo = match gix::discover(workdir) {
         Ok(r) => r,
         Err(err) => {
-            warn!(
-                "initial_git_scan: failed to open repository: {err} – falling back to full walk"
-            );
+            warn!("initial_git_scan: failed to open repository: {err} – falling back to full walk");
             initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
@@ -651,9 +647,7 @@ fn initial_git_scan_with_progress(
             );
         }
         Err(err) => {
-            warn!(
-                "initial_git_scan: failed to read git index: {err} – falling back to full walk"
-            );
+            warn!("initial_git_scan: failed to read git index: {err} – falling back to full walk");
             initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
@@ -714,9 +708,7 @@ fn apply_changes_by_files_with_progress(
     let candidates: Vec<PathBuf> = files
         .into_iter()
         .filter(|path| {
-            path.starts_with(root)
-                && !path.starts_with(&exclude_dir)
-                && !path.starts_with(&git_dir)
+            path.starts_with(root) && !path.starts_with(&exclude_dir) && !path.starts_with(&git_dir)
         })
         .collect();
 
@@ -1018,7 +1010,10 @@ mod tests {
         smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
 
         let stored_head = index.get_meta("git_head").unwrap();
-        assert!(stored_head.is_some(), "git_head should be stored after first run");
+        assert!(
+            stored_head.is_some(),
+            "git_head should be stored after first run"
+        );
     }
 
     #[test]
@@ -1102,7 +1097,11 @@ mod tests {
         smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
 
         // Add untracked file (not committed)
-        std::fs::write(temp_dir.path().join("untracked.txt"), "untracked_content_xyz").unwrap();
+        std::fs::write(
+            temp_dir.path().join("untracked.txt"),
+            "untracked_content_xyz",
+        )
+        .unwrap();
 
         // Smart scan should pick up untracked files
         smart_scan(temp_dir.path(), Arc::clone(&index)).unwrap();
@@ -1123,7 +1122,13 @@ mod tests {
         std::fs::write(&file_path, "new_file_content").unwrap();
 
         // Apply changes for this file
-        apply_changes_by_files(temp_dir.path(), &index, vec![file_path]).unwrap();
+        apply_changes_by_files_with_progress(
+            temp_dir.path(),
+            &index,
+            vec![file_path],
+            Arc::new(|_| {}),
+        )
+        .unwrap();
 
         let hits = index.search("new_file_content").unwrap();
         assert_eq!(hits.len(), 1);
@@ -1148,7 +1153,13 @@ mod tests {
         std::fs::remove_file(&file_path).unwrap();
 
         // Apply changes - should remove from index
-        apply_changes_by_files(temp_dir.path(), &index, vec![file_path]).unwrap();
+        apply_changes_by_files_with_progress(
+            temp_dir.path(),
+            &index,
+            vec![file_path],
+            Arc::new(|_| {}),
+        )
+        .unwrap();
 
         let hits = index.search("delete_me_content").unwrap();
         assert!(hits.is_empty());
@@ -1164,7 +1175,12 @@ mod tests {
         std::fs::create_dir(&dir_path).unwrap();
 
         // Apply changes - should not error even though it's a directory
-        let result = apply_changes_by_files(temp_dir.path(), &index, vec![dir_path]);
+        let result = apply_changes_by_files_with_progress(
+            temp_dir.path(),
+            &index,
+            vec![dir_path],
+            Arc::new(|_| {}),
+        );
         assert!(result.is_ok());
     }
 
@@ -1180,7 +1196,13 @@ mod tests {
         std::fs::write(&outside_file, "outside_content").unwrap();
 
         // Apply changes - should skip this file
-        apply_changes_by_files(temp_dir.path(), &index, vec![outside_file]).unwrap();
+        apply_changes_by_files_with_progress(
+            temp_dir.path(),
+            &index,
+            vec![outside_file],
+            Arc::new(|_| {}),
+        )
+        .unwrap();
 
         // File should NOT be indexed (it's outside the root)
         let hits = index.search("outside_content").unwrap();
@@ -1198,7 +1220,13 @@ mod tests {
         std::fs::write(&sf_file, "internal_content").unwrap();
 
         // Apply changes - should skip this file
-        apply_changes_by_files(temp_dir.path(), &index, vec![sf_file]).unwrap();
+        apply_changes_by_files_with_progress(
+            temp_dir.path(),
+            &index,
+            vec![sf_file],
+            Arc::new(|_| {}),
+        )
+        .unwrap();
 
         // File should NOT be indexed
         let hits = index.search("internal_content").unwrap();

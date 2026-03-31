@@ -31,7 +31,10 @@ pub fn attach_snippets(hits: Vec<SearchHit>, query: &str) -> Vec<SearchResult> {
         .collect()
 }
 
-pub fn search_database_file_with_snippets(path: &Path, query: &str) -> IndexResult<Vec<SearchResult>> {
+pub fn search_database_file_with_snippets(
+    path: &Path,
+    query: &str,
+) -> IndexResult<Vec<SearchResult>> {
     search_database_file_with_snippets_filtered(path, query, None)
 }
 
@@ -43,4 +46,3 @@ pub fn search_database_file_with_snippets_filtered(
     let hits = search_database_file_filtered(path, query, file_regex)?;
     Ok(attach_snippets(hits, query))
 }
-

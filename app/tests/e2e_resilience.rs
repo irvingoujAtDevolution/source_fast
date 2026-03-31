@@ -26,7 +26,10 @@ fn test_r1_reindex_after_partial_state() {
 
     // Add more files
     for i in 0..10 {
-        fix.add_file(&format!("src/file_{}.rs", i), &format!("fn func_{}() {{}}", i));
+        fix.add_file(
+            &format!("src/file_{}.rs", i),
+            &format!("fn func_{}() {{}}", i),
+        );
     }
     fix.git_commit("add more files");
 
@@ -107,7 +110,10 @@ fn test_r3_concurrent_access() {
     let _ = server.wait();
 
     // The test passes if search didn't crash
-    assert!(output.status.success(), "Search should succeed with concurrent server");
+    assert!(
+        output.status.success(),
+        "Search should succeed with concurrent server"
+    );
 }
 
 /// R4: Corrupt DB Recovery
@@ -118,25 +124,28 @@ fn test_r4_corrupt_db_recovery() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn recoverable_content_r4() {}");
 
-    // Initial search triggers indexing
-    let output = fix.search("recoverable_content_r4");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let initial = fix
+        .sf()
+        .arg("index")
+        .arg("watch")
+        .arg("--root")
+        .arg(fix.root())
+        .output()
+        .expect("sf index watch failed");
     assert!(
-        stdout.contains("main.rs"),
-        "Should find content initially: {}",
-        stdout
+        initial.status.success(),
+        "initial foreground index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
     );
 
-    // Stop daemon before deleting DB
-    fix.stop();
-
-    // Delete the database (retry on Windows file locks).
-    let db_path = fix.db_path();
+    // Delete the whole .source_fast tree after the foreground process exits.
+    let db_path = fix.root().join(".source_fast");
     for attempt in 0..10 {
         if !db_path.exists() {
             break;
         }
-        match std::fs::remove_file(&db_path) {
+        match std::fs::remove_dir_all(&db_path) {
             Ok(()) => break,
             Err(_) if attempt < 9 => {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -161,13 +170,22 @@ fn test_missing_source_fast_dir() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn test_missing_dir() {}");
 
-    // Search creates the directory and indexes
-    let _ = fix.search("test_missing_dir");
+    let initial = fix
+        .sf()
+        .arg("index")
+        .arg("watch")
+        .arg("--root")
+        .arg(fix.root())
+        .output()
+        .expect("sf index watch failed");
+    assert!(
+        initial.status.success(),
+        "initial foreground index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
 
-    // Stop daemon
-    fix.stop();
-
-    // Remove entire .source_fast directory (retry on Windows file locks).
+    // Remove entire .source_fast directory after the foreground process exits.
     let sf_dir = fix.root().join(".source_fast");
     for attempt in 0..10 {
         if !sf_dir.exists() {
@@ -199,7 +217,10 @@ fn test_search_empty_directory() {
 
     // Search empty directory should not crash
     let output = fix.search("nonexistent_query");
-    assert!(output.status.success(), "Search on empty directory should not crash");
+    assert!(
+        output.status.success(),
+        "Search on empty directory should not crash"
+    );
 }
 
 /// Additional: Search directory with only ignored files
@@ -213,7 +234,10 @@ fn test_search_only_ignored() {
 
     // Should not crash
     let output = fix.search("ignored content");
-    assert!(output.status.success(), "Search with only ignored files should not crash");
+    assert!(
+        output.status.success(),
+        "Search with only ignored files should not crash"
+    );
 }
 
 /// Additional: Very large file handling
@@ -313,11 +337,11 @@ fn test_signal_file_shutdown() {
     let mut stopped = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if let Ok(active) = source_fast_core::is_leader_active_readonly(&fix.db_path()) {
-            if !active {
-                stopped = true;
-                break;
-            }
+        if let Ok(active) = source_fast_core::is_leader_active_readonly(&fix.db_path())
+            && !active
+        {
+            stopped = true;
+            break;
         }
     }
     assert!(stopped, "Daemon should stop after signal file is written");

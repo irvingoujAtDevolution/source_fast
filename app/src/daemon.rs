@@ -195,11 +195,11 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
             info!("daemon: shutdown requested via signal file, exiting gracefully");
             break;
         }
-        if let Ok(Some(val)) = index.get_meta(meta_keys::SHUTDOWN_REQUESTED) {
-            if val == "true" {
-                info!("daemon: shutdown requested via meta, exiting gracefully");
-                break;
-            }
+        if let Ok(Some(val)) = index.get_meta(meta_keys::SHUTDOWN_REQUESTED)
+            && val == "true"
+        {
+            info!("daemon: shutdown requested via meta, exiting gracefully");
+            break;
         }
 
         // ---- Leader election ----
@@ -257,7 +257,8 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                         loop {
                             match progress_rx.recv_timeout(Duration::from_millis(500)) {
                                 Ok(event) => {
-                                    let force = matches!(event, ScanEvent::Finished | ScanEvent::Failed);
+                                    let force =
+                                        matches!(event, ScanEvent::Finished | ScanEvent::Failed);
                                     progress.apply_event(event, now_ms());
                                     progress_writer.persist(&progress, force);
                                 }
@@ -313,10 +314,8 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                     loop {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         if ready_poll.load(Ordering::SeqCst) {
-                            let _ = index_meta.set_meta(
-                                meta_keys::INDEX_STATUS,
-                                index_status::COMPLETE,
-                            );
+                            let _ = index_meta
+                                .set_meta(meta_keys::INDEX_STATUS, index_status::COMPLETE);
                             debug!("daemon: persisted index_status=complete");
                             break;
                         }
@@ -327,8 +326,7 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                 let index_for_watcher = Arc::clone(&index);
                 let root_for_watcher = root.clone();
                 task::spawn(async move {
-                    if let Err(err) =
-                        background_watcher(root_for_watcher, index_for_watcher).await
+                    if let Err(err) = background_watcher(root_for_watcher, index_for_watcher).await
                     {
                         error!("daemon: file watcher stopped: {err}");
                     }
@@ -501,23 +499,22 @@ pub fn ensure_daemon(root: &Path, db_path: &Path) -> Result<bool, Box<dyn std::e
 
     // Version mismatch: stop old daemon, wait, then spawn new one.
     if let Ok(Some(ver)) = source_fast_core::read_meta_readonly(db_path, meta_keys::DAEMON_VERSION)
+        && ver != env!("CARGO_PKG_VERSION")
     {
-        if ver != env!("CARGO_PKG_VERSION") {
-            info!(
-                old_version = %ver,
-                new_version = env!("CARGO_PKG_VERSION"),
-                "daemon version mismatch, restarting"
-            );
-            let shutdown_file = shutdown_signal_path(db_path);
-            let _ = std::fs::write(&shutdown_file, "true");
-            // Poll until the old daemon releases the lease, up to 5 seconds.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if !source_fast_core::is_leader_active_readonly(db_path).unwrap_or(true) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
+        info!(
+            old_version = %ver,
+            new_version = env!("CARGO_PKG_VERSION"),
+            "daemon version mismatch, restarting"
+        );
+        let shutdown_file = shutdown_signal_path(db_path);
+        let _ = std::fs::write(&shutdown_file, "true");
+        // Poll until the old daemon releases the lease, up to 5 seconds.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !source_fast_core::is_leader_active_readonly(db_path).unwrap_or(true) {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
@@ -568,9 +565,10 @@ pub fn wait_for_daemon(db_path: &Path, timeout: Duration) -> bool {
         }
 
         if start.elapsed() >= next_heartbeat {
-            let index_status = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_STATUS)
-                .ok()
-                .flatten();
+            let index_status =
+                source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_STATUS)
+                    .ok()
+                    .flatten();
             debug!(
                 db = %db_path.display(),
                 elapsed_ms = start.elapsed().as_millis() as u64,
@@ -751,8 +749,7 @@ fn read_registry() -> Vec<DaemonEntry> {
 
 fn write_registry(entries: &[DaemonEntry]) -> std::io::Result<()> {
     let path = daemons_json_path();
-    let content = serde_json::to_string_pretty(entries)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let content = serde_json::to_string_pretty(entries).map_err(std::io::Error::other)?;
     std::fs::write(&path, content)
 }
 

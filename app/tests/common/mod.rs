@@ -6,8 +6,8 @@
 #![allow(deprecated)] // cargo_bin() deprecation - the new API requires more investigation
 
 use assert_cmd::Command;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::{Mutex, MutexGuard};
@@ -200,12 +200,10 @@ impl TestFixture {
             if !db_path.exists() {
                 break;
             }
-            if let Ok(idx) = source_fast_core::PersistentIndex::open_or_create(&db_path) {
-                if let Ok(false) = idx.is_leader_active() {
-                    // Lease released — add brief extra sleep for Windows file handle cleanup.
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    break;
-                }
+            if let Ok(false) = source_fast_core::is_leader_active_readonly(&db_path) {
+                // Lease released — add brief extra sleep for Windows file handle cleanup.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                break;
             }
         }
     }
@@ -237,11 +235,9 @@ impl Drop for TestFixture {
             if !db_path.exists() {
                 break;
             }
-            if let Ok(idx) = source_fast_core::PersistentIndex::open_or_create(&db_path) {
-                if let Ok(false) = idx.is_leader_active() {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    break;
-                }
+            if let Ok(false) = source_fast_core::is_leader_active_readonly(&db_path) {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                break;
             }
         }
     }

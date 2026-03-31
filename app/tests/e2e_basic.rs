@@ -30,7 +30,10 @@ fn test_b1_fresh_init() {
 fn test_b2_basic_search() {
     let fix = TestFixture::new();
     fix.add_file("src/main.rs", "fn main() { println!(\"hello world\"); }");
-    fix.add_file("src/lib.rs", "pub fn calculate_sum(a: i32, b: i32) -> i32 { a + b }");
+    fix.add_file(
+        "src/lib.rs",
+        "pub fn calculate_sum(a: i32, b: i32) -> i32 { a + b }",
+    );
 
     // Search for existing content
     let output = fix.search("calculate_sum");
@@ -160,4 +163,46 @@ fn test_daemon_and_index_status_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Index status:"));
+}
+
+#[test]
+fn test_index_watch_foreground_scan_completes() {
+    let fix = TestFixture::new();
+    fix.git_init();
+    fix.add_file("src/main.rs", "fn main() { println!(\"watch\"); }");
+    fix.add_file("src/lib.rs", "pub fn watch_probe() {}");
+    fix.git_commit("initial");
+
+    let output = fix
+        .sf()
+        .arg("index")
+        .arg("watch")
+        .arg("--root")
+        .arg(fix.root())
+        .output()
+        .expect("sf index watch failed");
+
+    assert!(
+        output.status.success(),
+        "index watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fix.db_path().exists(),
+        "Database file should exist after watch"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Indexed") || stderr.contains("Index complete"),
+        "watch output should include a completion summary: {stderr}"
+    );
+
+    let hits = source_fast_core::search_database_file_filtered(&fix.db_path(), "watch_probe", None)
+        .expect("searching the foreground-built index should succeed");
+    assert!(
+        hits.iter().any(|hit| hit.path.contains("lib.rs")),
+        "foreground watch should have indexed lib.rs, got: {hits:?}"
+    );
 }

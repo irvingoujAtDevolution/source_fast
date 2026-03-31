@@ -123,8 +123,8 @@ fn test_f4_null_byte_injection() {
     fix.add_file("src/main.rs", "fn main() {}");
 
     // Create a file that looks like text but has null bytes
-    let content_with_null: Vec<u8> = b"fn looks_like_text() {\n    \x00\x00\x00\n    // hidden\n}"
-        .to_vec();
+    let content_with_null: Vec<u8> =
+        b"fn looks_like_text() {\n    \x00\x00\x00\n    // hidden\n}".to_vec();
     fix.add_binary("src/sneaky.rs", &content_with_null);
 
     // The file with null bytes should be skipped (treated as binary)

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -219,7 +219,9 @@ impl PersistentIndex {
 
         match resp_rx.recv() {
             Ok(result) => result,
-            Err(_) => Err(IndexError::Encode("writer thread dropped response".to_string())),
+            Err(_) => Err(IndexError::Encode(
+                "writer thread dropped response".to_string(),
+            )),
         }
     }
 
@@ -462,7 +464,10 @@ fn ensure_trailing_separator(path: &str) -> String {
     }
 }
 
-pub(crate) fn diff_sorted_trigrams(old: &[[u8; 3]], new: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+pub(crate) fn diff_sorted_trigrams(
+    old: &[[u8; 3]],
+    new: &[[u8; 3]],
+) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
     let mut removed = Vec::new();
     let mut added = Vec::new();
     let mut old_idx = 0usize;
@@ -497,11 +502,7 @@ pub(crate) fn diff_sorted_trigrams(old: &[[u8; 3]], new: &[[u8; 3]]) -> (Vec<[u8
 /// without going through the writer thread. Only safe when no
 /// `PersistentIndex` is active for this `db_path` (no daemon or MCP
 /// server running). Called during worktree copy setup before a daemon starts.
-pub fn rewrite_root_paths(
-    db_path: &Path,
-    old_root: &Path,
-    new_root: &Path,
-) -> IndexResult<()> {
+pub fn rewrite_root_paths(db_path: &Path, old_root: &Path, new_root: &Path) -> IndexResult<()> {
     let old_norm = normalize_path(old_root);
     let new_norm = normalize_path(new_root);
     let old_prefix = ensure_trailing_separator(&old_norm);
@@ -589,7 +590,8 @@ impl FileIdState {
             return Ok(id);
         }
         let file_id = self.next_file_id;
-        self.next_file_id = self.next_file_id
+        self.next_file_id = self
+            .next_file_id
             .checked_add(1)
             .ok_or_else(|| IndexError::Encode("file ID space exhausted (u32::MAX)".to_string()))?;
         self.file_ids.insert(path.to_string(), file_id);
@@ -701,7 +703,9 @@ fn writer_loop(
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    debug!("writer_loop channel disconnected while draining, processing remaining batch");
+                    debug!(
+                        "writer_loop channel disconnected while draining, processing remaining batch"
+                    );
                     break;
                 }
             }
@@ -1449,7 +1453,10 @@ mod tests {
         let acquired = index
             .try_acquire_writer_lease("holder_b", Duration::from_secs(5))
             .unwrap();
-        assert!(!acquired, "different holder should not acquire active lease");
+        assert!(
+            !acquired,
+            "different holder should not acquire active lease"
+        );
     }
 
     #[test]
@@ -1598,7 +1605,10 @@ mod tests {
 
         // Re-enable to allow search (search doesn't check write_enabled)
         let results = index.search("write_enabled_test").unwrap();
-        assert!(results.is_empty(), "file should not be indexed when writes disabled");
+        assert!(
+            results.is_empty(),
+            "file should not be indexed when writes disabled"
+        );
     }
 
     #[test]

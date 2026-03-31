@@ -124,6 +124,7 @@ fn test_s3_mcp_jsonrpc() {
     // Clean up - send EOF and kill
     drop(stdin);
     let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Additional: Case sensitivity

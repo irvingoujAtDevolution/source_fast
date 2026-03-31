@@ -56,15 +56,14 @@ pub fn normalize_path(path: &Path) -> String {
     }
 
     // File doesn't exist - canonicalize parent and append filename
-    if let Some(parent) = path.parent() {
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            if let Some(file_name) = path.file_name() {
-                return canonical_parent
-                    .join(file_name)
-                    .to_string_lossy()
-                    .into_owned();
-            }
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(canonical_parent) = parent.canonicalize()
+        && let Some(file_name) = path.file_name()
+    {
+        return canonical_parent
+            .join(file_name)
+            .to_string_lossy()
+            .into_owned();
     }
 
     // Ultimate fallback
@@ -128,9 +127,9 @@ mod tests {
         let trigrams = collect_trigrams("hello");
         // "hello" -> "hel", "ell", "llo"
         assert_eq!(trigrams.len(), 3);
-        assert!(trigrams.contains(&[b'h', b'e', b'l']));
-        assert!(trigrams.contains(&[b'e', b'l', b'l']));
-        assert!(trigrams.contains(&[b'l', b'l', b'o']));
+        assert!(trigrams.contains(b"hel"));
+        assert!(trigrams.contains(b"ell"));
+        assert!(trigrams.contains(b"llo"));
     }
 
     #[test]
@@ -180,22 +179,22 @@ mod tests {
         let trigrams = collect_trigrams("a b c");
         // "a b", " b ", "b c", " c " - wait, that's wrong
         // Actually: "a b" (indices 0,1,2), " b " (1,2,3), "b c" (2,3,4)
-        assert!(trigrams.contains(&[b'a', b' ', b'b']));
-        assert!(trigrams.contains(&[b' ', b'b', b' ']));
-        assert!(trigrams.contains(&[b'b', b' ', b'c']));
+        assert!(trigrams.contains(b"a b"));
+        assert!(trigrams.contains(b" b "));
+        assert!(trigrams.contains(b"b c"));
     }
 
     #[test]
     fn test_trigrams_special_chars() {
         let trigrams = collect_trigrams("fn(){}");
-        assert!(trigrams.contains(&[b'f', b'n', b'(']));
-        assert!(trigrams.contains(&[b'(', b')', b'{']));
+        assert!(trigrams.contains(b"fn("));
+        assert!(trigrams.contains(b"(){"));
     }
 
     #[test]
     fn test_trigrams_newlines() {
         let trigrams = collect_trigrams("a\nb\nc");
-        assert!(trigrams.contains(&[b'a', b'\n', b'b']));
+        assert!(trigrams.contains(b"a\nb"));
     }
 
     // ============ Binary Detection Tests ============
@@ -207,7 +206,10 @@ mod tests {
         file.flush().unwrap();
 
         let result = read_text_file(file.path()).unwrap();
-        assert!(result.is_none(), "File with null byte should be detected as binary");
+        assert!(
+            result.is_none(),
+            "File with null byte should be detected as binary"
+        );
     }
 
     #[test]
@@ -225,7 +227,10 @@ mod tests {
     fn test_empty_file_not_binary() {
         let file = NamedTempFile::new().unwrap();
         let result = read_text_file(file.path()).unwrap();
-        assert!(result.is_some(), "Empty file should not be considered binary");
+        assert!(
+            result.is_some(),
+            "Empty file should not be considered binary"
+        );
         assert_eq!(result.unwrap(), "");
     }
 
@@ -248,7 +253,10 @@ mod tests {
         file.flush().unwrap();
 
         let result = read_text_file(file.path()).unwrap();
-        assert!(result.is_none(), "Null byte within first 1024 bytes should be detected");
+        assert!(
+            result.is_none(),
+            "Null byte within first 1024 bytes should be detected"
+        );
     }
 
     #[test]
@@ -265,8 +273,14 @@ mod tests {
         // This actually succeeds because:
         // 1. Binary check only looks at first 1024 bytes (no null there)
         // 2. Null byte is valid UTF-8
-        assert!(result.is_some(), "File passes binary check and is valid UTF-8");
-        assert!(result.unwrap().contains('\0'), "Content should contain null byte");
+        assert!(
+            result.is_some(),
+            "File passes binary check and is valid UTF-8"
+        );
+        assert!(
+            result.unwrap().contains('\0'),
+            "Content should contain null byte"
+        );
     }
 
     // ============ Normalize Path Tests ============

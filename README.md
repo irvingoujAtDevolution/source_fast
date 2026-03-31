@@ -1,79 +1,129 @@
 # source_fast
 
-Fast, persistent trigram-based code search with MCP server support.
+Fast, persistent trigram-based source search with a daemonized CLI and MCP server.
 
-`source_fast` builds and maintains an on-disk SQLite index of your source code, enabling rapid substring search across large codebases. It's designed for git repositories and keeps the index synchronized with file changes.
+`source_fast` keeps a persistent on-disk index of a repository and uses it for fast substring search over code. The current implementation uses Heed/LMDB for storage, `gix` for git-aware incremental scans, `notify` for background file watching, and `rmcp` for MCP integration.
 
-## Features
+## Current Capabilities
 
-- **Trigram-based search**: Fast substring matching using 3-character trigrams
-- **Git-aware incremental indexing**: Only re-indexes changed files using git diff
-- **Real-time synchronization**: Background file watcher keeps index up-to-date
-- **MCP server**: Integrates with Claude and other AI tools via Model Context Protocol
-- **Cross-platform**: Works on Windows, macOS, and Linux
+- Fast substring search over indexed source files
+- Persistent LMDB-backed index stored in the repo under `.source_fast/`
+- Auto-started background daemon for warm search and continuous updates
+- Git-aware incremental scans plus full-scan fallback
+- Live index status, progress, and ETA reporting
+- Path search for file discovery
+- MCP server over stdio with a stateful `search_code` tool
+- Worktree-aware index bootstrapping from the primary worktree when possible
+
+## Workspace Layout
+
+This repository is a Cargo workspace with four crates:
+
+- `app`: `sf` CLI binary, daemon management, and MCP server
+- `core`: persistent index, trigram search, snippets, and LMDB storage
+- `fs`: filesystem scanning, git diff logic, and file watcher integration
+- `progress`: shared scan progress/status types
+
+There are also benchmark scripts and design notes at the workspace root, including the `REDB_*` and performance planning documents.
 
 ## Installation
 
-### From source
+Install the CLI from the workspace:
 
 ```bash
 cargo install --path app
 ```
 
-### Build from source
+Or build locally during development:
 
 ```bash
-git clone https://github.com/user/source_fast
-cd source_fast
-cargo build --release
+cargo build -p source_fast
 ```
 
-The binary will be at `target/release/sf`.
+The binary is `sf`.
 
-## Usage
+## Index Storage
 
-### Build the index
+By default, the index lives under the repository root:
 
-```bash
-# Index current directory
-sf index
-
-# Index a specific directory
-sf index --root /path/to/project
+```text
+.source_fast/
+  index.mdb/
+  daemon.log
 ```
 
-The index is stored at `.source_fast/index.mdb/` in the project root.
+`index.mdb` is an LMDB environment directory, not a single file. You can override the location with `--db`.
+
+## CLI Overview
 
 ### Search code
 
+`sf search` is the main entry point. If no daemon is running for the repo, it starts one automatically.
+
 ```bash
-# Search for a string (minimum 3 characters)
+# Search current repository
 sf search "function_name"
 
-# Filter by file path regex
-sf search --file-regex "\.rs$" "async fn"
+# Wait for the initial index to finish before searching
+sf search --wait "async fn"
+
+# Filter results by file path regex
+sf search --file-regex "\.rs$" "PersistentIndex"
+
+# Show all results
+sf search --limit 0 "leader lease"
 ```
+
+Notes:
+
+- Content search is substring-based, not full regex search
+- Queries shorter than 3 characters return no results
+- Initial searches may be partial while the first index build is still running
 
 ### Search file paths
 
+`sf search-file` does a case-insensitive substring match on indexed file paths.
+
 ```bash
-# Find files by name (case-insensitive substring)
 sf search-file "config"
+sf search-file --wait "daemon"
 ```
 
-### Run MCP server
+### Build and watch the index explicitly
+
+You can start warming the index before the first search:
+
+```bash
+sf index build
+sf index watch
+sf index status
+```
+
+`sf index build` starts the background daemon and kicks off indexing. `sf index watch` shows a live progress line with scan mode, processed files/bytes, and ETA.
+
+### Inspect and control daemons
+
+```bash
+sf status
+sf daemon status
+sf list
+sf stop
+sf stop --all
+```
+
+The status output includes root, PID, version, index status, scan mode, progress, current file, and leader lease information.
+
+### Run the MCP server
 
 ```bash
 sf server
 ```
 
-The server communicates via stdio using JSON-RPC (MCP protocol).
+The MCP server communicates over stdio and maintains the index in the background. Leader election ensures only one process writes to the index at a time.
 
 ## MCP Integration
 
-### Claude Desktop
-
-Add to your Claude Desktop configuration (`claude_desktop_config.json`):
+Example Claude Desktop configuration:
 
 ```json
 {
@@ -88,51 +138,49 @@ Add to your Claude Desktop configuration (`claude_desktop_config.json`):
 
 ### Available MCP Tools
 
-- **search_code**: Search code content with optional file path filtering
-  - `query` (required): Search string (minimum 3 characters)
-  - `file_regex` (optional): Regex to filter file paths
+- `search_code`
+  - `query`: required substring query
+  - `file_regex`: optional regex applied to result file paths
 
-## Environment Variables
-
-- `SOURCE_FAST_LOG_PATH`: Path to log file for MCP server (server logs are silent by default to keep stdio clean)
-- `RUST_LOG`: Log level filter (e.g., `info`, `debug`, `warn`)
+If the index is still building, the server returns a warning that results may be stale or incomplete.
 
 ## How It Works
 
-1. **Indexing**: Scans files, extracts trigrams (3-byte substrings), stores in SQLite with RoaringBitmap for efficient set operations
-2. **Git integration**: Uses git diff to detect changes between runs, only re-indexing modified files
-3. **Search**: Looks up trigrams from query, intersects file ID bitmaps, returns matching files with context snippets
-4. **Watching**: Background file watcher (via `notify` crate) updates index in real-time
+1. Files are scanned and converted into trigrams (3-byte substrings).
+2. The index stores trigram-to-file mappings in LMDB, using Roaring bitmaps for efficient intersections.
+3. On startup, the daemon performs a git-aware scan:
+   - first run: git index/worktree driven initial scan when possible
+   - later runs: incremental HEAD diff plus worktree changes
+   - fallback: full filesystem scan if git state is unavailable or diffing fails
+4. A background watcher keeps the index updated for file create/modify/delete events.
+5. Search intersects trigram bitmaps, then extracts snippets from matching files for display.
+
+## Environment Variables
+
+- `SOURCE_FAST_LOG_PATH`: append CLI or MCP logs to a file; if unset, those commands stay quiet by default
+- `RUST_LOG`: tracing filter, such as `info`, `debug`, or `warn`
+
+Daemon logs are written to `.source_fast/daemon.log`.
 
 ## Limitations
 
-- Queries must be at least 3 characters (trigram requirement)
-- Binary files are automatically excluded
-- Deletion tracking requires git (non-git directories don't track deletions properly)
-- Respects `.gitignore` patterns
+- Content queries must be at least 3 bytes long
+- Content search is substring-based; there is no regex content search
+- Binary files are skipped
+- Non-git directories fall back to full-scan behavior
+- Results can be temporarily stale while the initial background index build is still running
 
-## Wildcard `*` search (investigation)
+## Testing
 
-SQLite can’t directly help match `foo*bar` against file contents today because the database does not store
-file contents (only trigrams → file-id bitmaps and file paths). A practical approach is:
+The app crate includes end-to-end coverage for:
 
-- Parse query into literal segments split by unescaped `*`.
-- Choose an “anchor” segment (typically the longest / most trigrams) with length `>= 3` bytes and use the
-  existing trigram index to produce candidate files.
-- Verify the full `*` semantics by scanning candidate file lines and checking that segments appear in order
-  on the same line (fast final filter; keeps correctness).
-
-This keeps the index fast/simple while enabling a lightweight wildcard syntax without a full regex engine.
-
-## Project Structure
-
-```
-source_fast/
-├── core/     # Index storage, trigram search, SQLite backend
-├── fs/       # Filesystem scanning, git integration, file watcher
-├── app/      # CLI binary and MCP server
-└── llm/      # Documentation for AI assistants
-```
+- basic search behavior
+- filesystem updates
+- git-aware scanning
+- leader election and daemon readiness
+- MCP readiness
+- worktree behavior
+- resilience and edge cases
 
 ## License
 

@@ -102,4 +102,3 @@ fn test_mcp_search_code_eventually_no_warning() {
 
     panic!("Expected readiness warning to disappear; last response: {last:?}");
 }
-

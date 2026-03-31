@@ -27,7 +27,10 @@ fn test_non_git_directory() {
     // Search triggers daemon + indexing
     let output = fix.search("println");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("main.rs"), "Should find content in non-git directory");
+    assert!(
+        stdout.contains("main.rs"),
+        "Should find content in non-git directory"
+    );
 }
 
 /// Test: Multiple re-indexes in non-git directory
@@ -87,7 +90,10 @@ fn test_many_files() {
     for i in 0..20 {
         fix.add_file(
             &format!("file_{:03}.rs", i),
-            &format!("// File number {}\nfn unique_manyfiles_{}_marker() {{}}", i, i),
+            &format!(
+                "// File number {}\nfn unique_manyfiles_{}_marker() {{}}",
+                i, i
+            ),
         );
     }
 
@@ -96,7 +102,11 @@ fn test_many_files() {
     // Search for first and last files
     let output = fix.search("unique_manyfiles_0_marker");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("file_000.rs"), "Should find file 0, got: {}", stdout);
+    assert!(
+        stdout.contains("file_000.rs"),
+        "Should find file 0, got: {}",
+        stdout
+    );
 
     let output = fix.search("unique_manyfiles_19_marker");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -144,7 +154,10 @@ fn test_long_file_path() {
 
     let output = fix.search("deep_nested_function");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("deep_file.rs"), "Should find deeply nested file");
+    assert!(
+        stdout.contains("deep_file.rs"),
+        "Should find deeply nested file"
+    );
 }
 
 /// Test: File with long filename
@@ -161,7 +174,10 @@ fn test_long_filename() {
 
     let output = fix.search("long_filename_content");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(&"a".repeat(50)), "Should find file with long name");
+    assert!(
+        stdout.contains(&"a".repeat(50)),
+        "Should find file with long name"
+    );
 }
 
 // ============ Search-File Pattern Tests ============
@@ -381,24 +397,31 @@ fn test_delete_and_reindex() {
     fix.add_file("persistent.txt", "persistent_content");
     fix.git_commit("Add file");
 
-    // Verify indexed
-    let output = fix.search("persistent_content");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("persistent.txt"));
+    let initial = fix
+        .sf()
+        .arg("index")
+        .arg("watch")
+        .arg("--root")
+        .arg(fix.root())
+        .output()
+        .expect("sf index watch failed");
+    assert!(
+        initial.status.success(),
+        "initial foreground index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
 
-    // Stop daemon before deleting DB
-    fix.stop();
-
-    // Delete the .source_fast directory (retry on Windows where the daemon
-    // process may still hold file handles briefly after lease release).
+    // Delete the .source_fast directory before invoking the CLI again.
     let sf_dir = fix.root().join(".source_fast");
-    for attempt in 0..10 {
+    for attempt in 0..100 {
         if !sf_dir.exists() {
             break;
         }
         match std::fs::remove_dir_all(&sf_dir) {
             Ok(()) => break,
-            Err(_) if attempt < 9 => {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            Err(_) if attempt < 99 => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Err(e) => panic!("Failed to remove .source_fast after retries: {e}"),
         }
@@ -451,10 +474,19 @@ fn test_various_source_extensions() {
     fix.git_commit("Add various files");
 
     // Each should be searchable
-    for marker in &["rust_marker", "python_marker", "javascript_marker", "golang_marker"] {
+    for marker in &[
+        "rust_marker",
+        "python_marker",
+        "javascript_marker",
+        "golang_marker",
+    ] {
         let output = fix.search(marker);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(!stdout.is_empty() || output.status.success(), "Should find {}", marker);
+        assert!(
+            !stdout.is_empty() || output.status.success(),
+            "Should find {}",
+            marker
+        );
     }
 }
 

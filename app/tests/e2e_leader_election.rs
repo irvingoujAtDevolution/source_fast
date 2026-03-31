@@ -20,7 +20,10 @@ fn wait_for_log(path: &Path, needle: &str, timeout: Duration) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("Timed out waiting for log to contain '{needle}' at {}", path.display());
+    panic!(
+        "Timed out waiting for log to contain '{needle}' at {}",
+        path.display()
+    );
 }
 
 fn log_path(root: &Path, name: &str) -> PathBuf {
@@ -94,9 +97,15 @@ fn test_only_one_writer_with_multiple_servers() {
     wait_for_log(&log_b, "role=", Duration::from_secs(10));
     wait_for_log(&log_c, "role=", Duration::from_secs(10));
 
-    let a = std::fs::read_to_string(&log_a).unwrap_or_default().contains("role=writer");
-    let b = std::fs::read_to_string(&log_b).unwrap_or_default().contains("role=writer");
-    let c = std::fs::read_to_string(&log_c).unwrap_or_default().contains("role=writer");
+    let a = std::fs::read_to_string(&log_a)
+        .unwrap_or_default()
+        .contains("role=writer");
+    let b = std::fs::read_to_string(&log_b)
+        .unwrap_or_default()
+        .contains("role=writer");
+    let c = std::fs::read_to_string(&log_c)
+        .unwrap_or_default()
+        .contains("role=writer");
 
     let writers = [a, b, c].into_iter().filter(|v| *v).count();
     assert_eq!(

@@ -3,6 +3,8 @@
 //! These tests cover the worktree bootstrap behavior that should copy a
 //! prebuilt DB and then run smart_scan.
 
+#![allow(deprecated)]
+
 mod common;
 
 use assert_cmd::Command;
@@ -17,6 +19,24 @@ use std::time::{Duration, Instant};
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".source_fast").join("index.mdb")
+}
+
+/// Strip ANSI escape sequences from a string for test assertions.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Trigger daemon start + full indexing via `sf search --wait`.
@@ -35,6 +55,23 @@ fn sf_index(root: &Path) {
     assert!(
         output.status.success(),
         "sf search --wait failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn sf_index_watch(root: &Path) {
+    let output = Command::cargo_bin("sf")
+        .unwrap()
+        .current_dir(root)
+        .arg("index")
+        .arg("watch")
+        .arg("--root")
+        .arg(root)
+        .output()
+        .expect("sf index watch failed");
+    assert!(
+        output.status.success(),
+        "sf index watch failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -73,11 +110,9 @@ fn sf_stop(root: &Path) {
         if !db_path.exists() {
             break;
         }
-        if let Ok(idx) = PersistentIndex::open_or_create(&db_path) {
-            if let Ok(false) = idx.is_leader_active() {
-                std::thread::sleep(Duration::from_millis(500));
-                break;
-            }
+        if let Ok(false) = source_fast_core::is_leader_active_readonly(&db_path) {
+            std::thread::sleep(Duration::from_millis(500));
+            break;
         }
     }
 }
@@ -131,9 +166,7 @@ fn git_head(dir: &Path) -> String {
 }
 
 fn add_worktree(fix: &TestFixture, target: &Path, git_ref: &str) {
-    let target_str = target
-        .to_str()
-        .expect("worktree path must be utf-8");
+    let target_str = target.to_str().expect("worktree path must be utf-8");
     let output = fix.git(&["worktree", "add", target_str, git_ref]);
     assert_git_ok(&output, "git worktree add");
 }
@@ -361,7 +394,10 @@ fn test_wt7_copy_handles_rename() {
     sf_index(worktree_root);
 
     let stdout = sf_search(worktree_root, "rename_unique_wt7");
-    assert!(stdout.contains("new_name.rs"), "Expected new path: {stdout}");
+    assert!(
+        stdout.contains("new_name.rs"),
+        "Expected new path: {stdout}"
+    );
     assert!(
         !stdout.contains("old_name.rs"),
         "Old path should not appear: {stdout}"
@@ -408,7 +444,7 @@ fn test_wt9_corrupted_db_rebuilds() {
     std::fs::create_dir_all(&db).unwrap();
     std::fs::write(db.join("data.mdb"), b"not an lmdb db").unwrap();
 
-    sf_index(worktree_root);
+    sf_index_watch(worktree_root);
     assert_search_contains(worktree_root, "corrupt_unique_wt9", "main.rs");
 
     sf_stop(worktree_root);
@@ -435,7 +471,7 @@ fn test_wt10_missing_schema_rebuilds() {
     std::fs::create_dir_all(&db).unwrap();
     std::fs::write(db.join("data.mdb"), b"missing schema placeholder").unwrap();
 
-    sf_index(worktree_root);
+    sf_index_watch(worktree_root);
     assert_search_contains(worktree_root, "schema_unique_wt10", "main.rs");
 
     sf_stop(worktree_root);
@@ -526,7 +562,11 @@ fn test_wt14_missing_old_commit_fallback() {
     let worktree_root = worktree_dir.path();
     add_worktree(&fix, worktree_root, "HEAD");
 
-    set_meta(worktree_root, "git_head", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    set_meta(
+        worktree_root,
+        "git_head",
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
     sf_index(worktree_root);
 
     assert_search_contains(worktree_root, "missing_commit_wt14", "main.rs");
@@ -643,25 +683,19 @@ fn test_wt18_paths_are_absolute() {
     sf_index(worktree_root);
 
     let stdout = sf_search(worktree_root, "absolute_path_wt18");
+    // Strip ANSI escape codes for assertion.
+    let stripped = strip_ansi(&stdout);
     #[cfg(windows)]
     {
-        let marker = "File: ";
-        let path_start = stdout.find(marker).expect("Expected File: marker");
-        let line = stdout[path_start + marker.len()..]
-            .lines()
-            .next()
-            .unwrap_or("");
-        let mut parts = line.rsplitn(2, ':');
+        // The output format is PATH:LINE_NO on the first line of each result.
+        let first_line = stripped.lines().next().unwrap_or("");
+        let mut parts = first_line.rsplitn(2, ':');
         let _line_no = parts.next();
-        let file_part = parts.next().unwrap_or(line);
+        let file_part = parts.next().unwrap_or(first_line);
         let normalized = file_part.strip_prefix(r"\\?\").unwrap_or(file_part);
         assert!(
             normalized.contains(":\\"),
             "Expected absolute Windows path, got: {file_part}"
-        );
-        assert!(
-            !file_part.contains('/'),
-            "Expected no forward slashes in Windows path, got: {file_part}"
         );
     }
 

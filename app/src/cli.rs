@@ -1,13 +1,19 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use source_fast_core::{
-    IndexError, PersistentIndex, extract_snippet, read_meta_readonly, rewrite_root_paths,
-    search_database_file_filtered, search_files_in_database,
+    IndexError, PersistentIndex, extract_snippet, is_leader_active_readonly, now_millis,
+    read_meta_readonly, rewrite_root_paths, search_database_file_filtered,
+    search_files_in_database,
 };
-use source_fast_progress::IndexProgress;
+use source_fast_fs::smart_scan_with_progress;
+use source_fast_progress::{IndexProgress, ScanEvent};
+use tokio::task;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon;
@@ -43,6 +49,295 @@ fn truncate_line(line: &str, max_chars: usize) -> String {
         line.to_string()
     } else {
         format!("{}...", &line[..max_chars])
+    }
+}
+
+struct WatchState {
+    processed_files: AtomicUsize,
+    total_files: AtomicUsize,
+    processed_bytes: AtomicU64,
+    total_bytes: AtomicU64,
+    phase: Mutex<String>,
+    current_file: Mutex<String>,
+    mode: Mutex<String>,
+    started_at_ms: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+struct WatchSnapshot {
+    processed_files: usize,
+    total_files: Option<usize>,
+    processed_bytes: u64,
+    total_bytes: Option<u64>,
+    phase: String,
+    current_file: String,
+    mode: String,
+    started_at_ms: Option<u64>,
+}
+
+impl WatchState {
+    fn new() -> Self {
+        Self {
+            processed_files: AtomicUsize::new(0),
+            total_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            phase: Mutex::new("building".to_string()),
+            current_file: Mutex::new(String::new()),
+            mode: Mutex::new("scanning".to_string()),
+            started_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn apply_event(&self, event: ScanEvent) {
+        match event {
+            ScanEvent::Started(plan) => {
+                self.processed_files.store(0, Ordering::Relaxed);
+                self.total_files.store(plan.total_files, Ordering::Relaxed);
+                self.processed_bytes.store(0, Ordering::Relaxed);
+                self.total_bytes.store(plan.total_bytes, Ordering::Relaxed);
+                self.started_at_ms.store(now_ms(), Ordering::Relaxed);
+                *self.phase.lock().unwrap() = "building".to_string();
+                *self.mode.lock().unwrap() = plan.mode.as_str().to_string();
+                self.current_file.lock().unwrap().clear();
+            }
+            ScanEvent::FileStarted(path) => {
+                *self.current_file.lock().unwrap() = path;
+            }
+            ScanEvent::FileFinished { path, bytes } => {
+                self.processed_files.fetch_add(1, Ordering::Relaxed);
+                self.processed_bytes.fetch_add(bytes, Ordering::Relaxed);
+                *self.current_file.lock().unwrap() = path;
+            }
+            ScanEvent::Finished => {
+                *self.phase.lock().unwrap() = "complete".to_string();
+            }
+            ScanEvent::Failed => {
+                *self.phase.lock().unwrap() = "failed".to_string();
+            }
+        }
+    }
+
+    fn set_phase(&self, phase: &str) {
+        *self.phase.lock().unwrap() = phase.to_string();
+    }
+
+    fn snapshot(&self) -> WatchSnapshot {
+        let total_files = self.total_files.load(Ordering::Relaxed);
+        let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+        let started_at_ms = self.started_at_ms.load(Ordering::Relaxed);
+
+        WatchSnapshot {
+            processed_files: self.processed_files.load(Ordering::Relaxed),
+            total_files: (total_files > 0).then_some(total_files),
+            processed_bytes: self.processed_bytes.load(Ordering::Relaxed),
+            total_bytes: (total_bytes > 0).then_some(total_bytes),
+            phase: self.phase.lock().unwrap().clone(),
+            current_file: self.current_file.lock().unwrap().clone(),
+            mode: self.mode.lock().unwrap().clone(),
+            started_at_ms: (started_at_ms > 0).then_some(started_at_ms),
+        }
+    }
+}
+
+fn watch_snapshot_to_progress(snapshot: &WatchSnapshot) -> IndexProgress {
+    IndexProgress {
+        phase: snapshot.phase.clone(),
+        mode: Some(snapshot.mode.clone()),
+        started_at_ms: snapshot.started_at_ms,
+        processed_files: snapshot.processed_files,
+        total_files: snapshot.total_files,
+        processed_bytes: snapshot.processed_bytes,
+        total_bytes: snapshot.total_bytes,
+        current_path: (!snapshot.current_file.is_empty()).then(|| snapshot.current_file.clone()),
+        last_completed_path: (!snapshot.current_file.is_empty())
+            .then(|| snapshot.current_file.clone()),
+    }
+}
+
+fn queue_progress_meta(index: &PersistentIndex, progress: &IndexProgress) {
+    if let Ok(json) = serde_json::to_string(progress) {
+        let _ = index.set_meta_queued(daemon::meta_keys::INDEX_PROGRESS, &json);
+    }
+}
+
+fn now_ms() -> u64 {
+    now_millis().max(0) as u64
+}
+
+fn best_effort_stop_daemon(db_path: &Path) {
+    if !db_path.exists() {
+        return;
+    }
+
+    if !is_leader_active_readonly(db_path).unwrap_or(false) {
+        return;
+    }
+
+    if let Err(err) = daemon::stop_daemon(db_path) {
+        warn!(db = %db_path.display(), error = ?err, "failed to request daemon shutdown before foreground watch");
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !is_leader_active_readonly(db_path).unwrap_or(true) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String) {
+    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+    let progress = watch_snapshot_to_progress(snapshot);
+    let bar = match snapshot.total_files {
+        Some(total) if total > 0 => {
+            let ratio = (snapshot.processed_files as f64 / total as f64).min(1.0);
+            let width = 30usize;
+            let filled = (ratio * width as f64) as usize;
+            let empty = width.saturating_sub(filled);
+            format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+        }
+        _ => "[██████████████████████████████]".to_string(),
+    };
+
+    let files_part = match snapshot.total_files {
+        Some(total) if total > 0 => {
+            let pct = (snapshot.processed_files as f64 / total as f64 * 100.0).min(100.0);
+            format!("{}/{} ({pct:.0}%)", snapshot.processed_files, total)
+        }
+        _ => format!("{} files", snapshot.processed_files),
+    };
+
+    let bytes_part = match snapshot.total_bytes {
+        Some(total) if total > 0 => {
+            format!(
+                "{}/{}",
+                format_bytes(snapshot.processed_bytes),
+                format_bytes(total)
+            )
+        }
+        _ => format_bytes(snapshot.processed_bytes),
+    };
+
+    let eta_part = if snapshot.phase == "complete" {
+        "ETA done".to_string()
+    } else if snapshot.phase == "failed" {
+        "ETA failed".to_string()
+    } else {
+        estimate_eta_seconds(&progress)
+            .map(|secs| format!("ETA {}", format_eta(secs)))
+            .unwrap_or_else(|| "ETA --".to_string())
+    };
+
+    let throughput = snapshot
+        .started_at_ms
+        .and_then(|started_at_ms| {
+            let elapsed_ms = now_ms().saturating_sub(started_at_ms);
+            (elapsed_ms > 0)
+                .then_some(snapshot.processed_files as f64 / (elapsed_ms as f64 / 1000.0))
+        })
+        .unwrap_or(0.0);
+
+    let spinner = if snapshot.phase == "building" {
+        SPINNER[(tick / 6) % SPINNER.len()]
+    } else {
+        ' '
+    };
+
+    let headline = format!(
+        "\x1b[36m{} {}\x1b[0m {} {}  {}  {}  {:.0} files/sec",
+        spinner, snapshot.mode, bar, files_part, bytes_part, eta_part, throughput
+    );
+
+    let file_name = if snapshot.current_file.is_empty() {
+        "waiting for files...".to_string()
+    } else {
+        let display = clean_display_path(&snapshot.current_file);
+        let name = display.rsplit(['/', '\\']).next().unwrap_or(display);
+        truncate_line(name, 80)
+    };
+    let detail = format!("\x1b[2m  {file_name}\x1b[0m");
+
+    (headline, detail)
+}
+
+fn print_watch_frame(lines: &(String, String), first_frame: bool) {
+    if first_frame {
+        eprint!("\x1b[2K{}\n\x1b[2K{}", lines.0, lines.1);
+    } else {
+        eprint!("\r\x1b[1A\x1b[2K{}\n\x1b[2K{}", lines.0, lines.1);
+    }
+    let _ = io::stderr().flush();
+}
+
+fn print_watch_summary(snapshot: &WatchSnapshot) {
+    let elapsed_secs = snapshot
+        .started_at_ms
+        .map(|started_at_ms| now_ms().saturating_sub(started_at_ms).div_ceil(1000))
+        .unwrap_or(0);
+    let rate = if elapsed_secs > 0 {
+        snapshot.processed_files as u64 / elapsed_secs.max(1)
+    } else {
+        0
+    };
+    let status = if snapshot.phase == "complete" {
+        "✓"
+    } else {
+        "✗"
+    };
+    let summary = format!(
+        "{status} Indexed {} files ({}) in {} {}",
+        snapshot.processed_files,
+        format_bytes(snapshot.processed_bytes),
+        format_eta(elapsed_secs),
+        if snapshot.phase == "complete" {
+            format!("{} files/sec", rate)
+        } else {
+            "before failing".to_string()
+        }
+    );
+    eprint!("\r\x1b[1A\x1b[2K{summary}\n\x1b[2K\n");
+}
+
+fn watch_progress_polling(db_path: &Path) {
+    let poll_interval = Duration::from_millis(100);
+    let mut last_line_len = 0usize;
+
+    loop {
+        let status = read_meta_readonly(db_path, daemon::meta_keys::INDEX_STATUS)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        let progress = read_meta_readonly(db_path, daemon::meta_keys::INDEX_PROGRESS)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<IndexProgress>(&json).ok());
+
+        let line = match &progress {
+            Some(p) => format_progress_line(p, &status),
+            None if status == "complete" => "\x1b[32m✓ Index complete.\x1b[0m".to_string(),
+            None if status == "failed" => "\x1b[31m✗ Index build failed.\x1b[0m".to_string(),
+            None => "Waiting for daemon...".to_string(),
+        };
+
+        let padding = if line.len() < last_line_len {
+            " ".repeat(last_line_len - line.len())
+        } else {
+            String::new()
+        };
+        eprint!("\r{line}{padding}");
+        last_line_len = line.len();
+
+        if status == "complete" || status == "failed" {
+            eprintln!();
+            break;
+        }
+
+        std::thread::sleep(poll_interval);
     }
 }
 
@@ -126,9 +421,7 @@ fn copy_db_from_root(source_root: &Path, db_path: &Path) -> std::io::Result<bool
 }
 
 fn copy_db_from_primary_worktree(root: &Path, db_path: &Path) -> Option<PathBuf> {
-    let Some(primary_root) = primary_worktree_root(root) else {
-        return None;
-    };
+    let primary_root = primary_worktree_root(root)?;
 
     if same_path(&primary_root, root) {
         return None;
@@ -315,7 +608,9 @@ pub async fn run_search_with_daemon(
     );
 
     if first_time {
-        eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
+        eprintln!(
+            "Starting index for the first time. Results will be partial until indexing completes."
+        );
     }
 
     if !was_running {
@@ -393,9 +688,7 @@ pub async fn run_search_with_daemon(
                 return;
             }
             let path = PathBuf::from(&hit.path);
-            let snippet = extract_snippet(&path, &query_for_workers)
-                .ok()
-                .flatten();
+            let snippet = extract_snippet(&path, &query_for_workers).ok().flatten();
             // Send error means receiver dropped (limit reached) — stop.
             if tx.send((hit.path.clone(), snippet)).is_err() {
                 done_for_workers.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -485,7 +778,9 @@ pub async fn run_file_search_with_daemon(
     );
 
     if first_time {
-        eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
+        eprintln!(
+            "Starting index for the first time. Results will be partial until indexing completes."
+        );
     }
 
     if !was_running {
@@ -628,10 +923,7 @@ pub async fn run_stop_all() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     for info in &daemons {
-        let db = info
-            .root
-            .join(".source_fast")
-            .join("index.mdb");
+        let db = info.root.join(".source_fast").join("index.mdb");
         daemon::stop_daemon(&db)?;
         println!("Stop requested for {}", info.root.display());
     }
@@ -659,8 +951,7 @@ pub async fn run_status(
             println!("Root:         {}", info.root.display());
             println!(
                 "PID:          {}",
-                info.pid
-                    .map_or("unknown".to_string(), |p| p.to_string())
+                info.pid.map_or("unknown".to_string(), |p| p.to_string())
             );
             println!(
                 "Version:      {}",
@@ -676,10 +967,7 @@ pub async fn run_status(
                 }
                 match progress.total_files {
                     Some(total) => {
-                        println!(
-                            "Progress:     {}/{} files",
-                            progress.processed_files, total
-                        );
+                        println!("Progress:     {}/{} files", progress.processed_files, total);
                     }
                     None => {
                         println!("Progress:     {} files", progress.processed_files);
@@ -701,10 +989,10 @@ pub async fn run_status(
                 "Leader:       {}",
                 info.leader_holder.unwrap_or_else(|| "none".to_string())
             );
-            if let Some(expires_at_ms) = info.leader_expires_ms {
-                if let Some(remaining) = format_remaining_lease(expires_at_ms) {
-                    println!("Lease TTL:    {remaining}");
-                }
+            if let Some(expires_at_ms) = info.leader_expires_ms
+                && let Some(remaining) = format_remaining_lease(expires_at_ms)
+            {
+                println!("Lease TTL:    {remaining}");
             }
         }
         None => {
@@ -727,11 +1015,8 @@ pub async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}\tPID={}\tindex={}\tversion={}",
             info.root.display(),
-            info.pid
-                .map_or("?".to_string(), |p| p.to_string()),
-            info.index_status
-                .as_deref()
-                .unwrap_or("?"),
+            info.pid.map_or("?".to_string(), |p| p.to_string()),
+            info.index_status.as_deref().unwrap_or("?"),
             info.version.as_deref().unwrap_or("?"),
         );
     }
@@ -773,48 +1058,136 @@ pub async fn run_index_watch(
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
     if !db_path.exists() {
-        eprintln!("No index found at {}. Run `sf index build` first.", db_path.display());
+        let created = open_index_with_worktree_copy(&root, &db_path)?;
+        drop(created);
+    }
+
+    best_effort_stop_daemon(&db_path);
+
+    let index = Arc::new(open_index_with_worktree_copy(&root, &db_path)?);
+    let holder = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("watch:{}:{nanos}", std::process::id())
+    };
+    let lease_ttl = Duration::from_secs(5);
+
+    let acquired = {
+        let index = Arc::clone(&index);
+        let holder = holder.clone();
+        task::spawn_blocking(move || index.try_acquire_writer_lease(&holder, lease_ttl)).await??
+    };
+
+    if !acquired {
+        eprintln!("Another writer is active. Attaching to persisted progress...");
+        watch_progress_polling(&db_path);
         return Ok(());
     }
 
-    let poll_interval = Duration::from_millis(100);
-    let mut last_line_len = 0usize;
+    index.set_write_enabled(true);
+    let _ = index.set_meta_queued(
+        daemon::meta_keys::INDEX_STATUS,
+        daemon::index_status::BUILDING,
+    );
 
-    loop {
-        let status = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_STATUS)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+    let state = Arc::new(WatchState::new());
+    let initial_progress = watch_snapshot_to_progress(&state.snapshot());
+    queue_progress_meta(&index, &initial_progress);
+    let _ = index.flush();
 
-        let progress = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_PROGRESS)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<IndexProgress>(&json).ok());
+    let render_state = Arc::clone(&state);
+    let render_handle = std::thread::spawn(move || {
+        let mut first_frame = true;
+        let mut tick = 0usize;
+        loop {
+            let snapshot = render_state.snapshot();
+            let frame = render_watch_frame(&snapshot, tick);
+            print_watch_frame(&frame, first_frame);
+            first_frame = false;
+            tick = tick.wrapping_add(1);
 
-        let line = match &progress {
-            Some(p) => format_progress_line(p, &status),
-            None if status == "complete" => "\x1b[32m✓ Index complete.\x1b[0m".to_string(),
-            None if status == "failed" => "\x1b[31m✗ Index build failed.\x1b[0m".to_string(),
-            None => "Waiting for daemon...".to_string(),
-        };
+            if snapshot.phase == "complete" || snapshot.phase == "failed" {
+                break;
+            }
 
-        // Overwrite the current line.
-        let padding = if line.len() < last_line_len {
-            " ".repeat(last_line_len - line.len())
-        } else {
-            String::new()
-        };
-        eprint!("\r{line}{padding}");
-        last_line_len = line.len();
-
-        if status == "complete" || status == "failed" {
-            eprintln!();
-            break;
+            std::thread::sleep(Duration::from_millis(16));
         }
+    });
 
-        std::thread::sleep(poll_interval);
+    let renew_index = Arc::clone(&index);
+    let renew_holder = holder.clone();
+    let renew_failed = Arc::new(AtomicUsize::new(0));
+    let renew_failed_for_thread = Arc::clone(&renew_failed);
+    let renew_handle = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            if matches!(
+                renew_index.get_meta(daemon::meta_keys::INDEX_STATUS),
+                Ok(Some(ref status)) if status == "complete" || status == "failed"
+            ) {
+                break;
+            }
+
+            match renew_index.renew_writer_lease(&renew_holder, lease_ttl) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    renew_index.set_write_enabled(false);
+                    renew_failed_for_thread.store(1, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    });
+
+    let callback_state = Arc::clone(&state);
+    let progress_callback: Arc<dyn Fn(ScanEvent) + Send + Sync> = Arc::new(move |event| {
+        callback_state.apply_event(event);
+    });
+
+    let scan_result = {
+        let scan_root = root.clone();
+        let scan_index = Arc::clone(&index);
+        task::spawn_blocking(move || {
+            smart_scan_with_progress(&scan_root, scan_index, progress_callback)
+        })
+        .await?
+    };
+
+    if renew_failed.load(Ordering::SeqCst) != 0 {
+        state.set_phase("failed");
+    } else if scan_result.is_ok() {
+        state.set_phase("complete");
+    } else {
+        state.set_phase("failed");
     }
 
+    let final_snapshot = state.snapshot();
+    let final_progress = watch_snapshot_to_progress(&final_snapshot);
+    queue_progress_meta(&index, &final_progress);
+    let final_status = if final_snapshot.phase == "complete" {
+        daemon::index_status::COMPLETE
+    } else {
+        "failed"
+    };
+    let _ = index.set_meta_queued(daemon::meta_keys::INDEX_STATUS, final_status);
+    let _ = index.flush();
+
+    let _ = renew_handle.join();
+    let _ = render_handle.join();
+    print_watch_summary(&final_snapshot);
+
+    index.set_write_enabled(false);
+    let _ = index.release_writer_lease(&holder);
+
+    if renew_failed.load(Ordering::SeqCst) != 0 {
+        return Err("foreground watch lost the writer lease before completion".into());
+    }
+
+    scan_result?;
     Ok(())
 }
 
@@ -831,7 +1204,11 @@ fn format_progress_line(p: &IndexProgress, status: &str) -> String {
 
     let bytes_part = match p.total_bytes {
         Some(total) if total > 0 => {
-            format!(" {}/{}", format_bytes(p.processed_bytes), format_bytes(total))
+            format!(
+                " {}/{}",
+                format_bytes(p.processed_bytes),
+                format_bytes(total)
+            )
         }
         _ if p.processed_bytes > 0 => format!(" {}", format_bytes(p.processed_bytes)),
         _ => String::new(),
@@ -871,9 +1248,7 @@ fn format_progress_line(p: &IndexProgress, status: &str) -> String {
         }
     };
 
-    format!(
-        "\x1b[36m{mode}\x1b[0m{bar} {files_part}{bytes_part}{eta} \x1b[2m{file_name}\x1b[0m"
-    )
+    format!("\x1b[36m{mode}\x1b[0m{bar} {files_part}{bytes_part}{eta} \x1b[2m{file_name}\x1b[0m")
 }
 
 fn format_bytes(bytes: u64) -> String {

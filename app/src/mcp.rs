@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use source_fast_fs::{background_watcher, smart_scan};
 use regex::Regex;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -18,6 +17,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use source_fast_core::PersistentIndex;
+use source_fast_fs::{background_watcher, smart_scan};
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -170,7 +170,10 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
             if !is_writer_for_task.load(Ordering::SeqCst) {
                 let idx = Arc::clone(&election_index);
                 let holder_clone = holder.clone();
-                let acquired = match task::spawn_blocking(move || idx.try_acquire_writer_lease(&holder_clone, lease_ttl)).await
+                let acquired = match task::spawn_blocking(move || {
+                    idx.try_acquire_writer_lease(&holder_clone, lease_ttl)
+                })
+                .await
                 {
                     Ok(Ok(v)) => v,
                     Ok(Err(err)) => {
@@ -211,9 +214,10 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
                     let root_for_scan = election_root.clone();
                     let ready_for_scan = Arc::clone(&election_ready);
                     task::spawn(async move {
-                        let res =
-                            task::spawn_blocking(move || smart_scan(&root_for_scan, index_for_scan))
-                                .await;
+                        let res = task::spawn_blocking(move || {
+                            smart_scan(&root_for_scan, index_for_scan)
+                        })
+                        .await;
                         match res {
                             Ok(Ok(())) => {
                                 ready_for_scan.store(true, Ordering::SeqCst);
@@ -232,7 +236,9 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
                     let index_for_watcher = Arc::clone(&election_index);
                     let root_for_watcher = election_root.clone();
                     task::spawn(async move {
-                        if let Err(err) = background_watcher(root_for_watcher, index_for_watcher).await {
+                        if let Err(err) =
+                            background_watcher(root_for_watcher, index_for_watcher).await
+                        {
                             error!("file watcher stopped: {err}");
                         }
                     });
@@ -241,7 +247,10 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
                 // Renew lease.
                 let idx = Arc::clone(&election_index);
                 let holder_clone = holder.clone();
-                let renewed = match task::spawn_blocking(move || idx.renew_writer_lease(&holder_clone, lease_ttl)).await
+                let renewed = match task::spawn_blocking(move || {
+                    idx.renew_writer_lease(&holder_clone, lease_ttl)
+                })
+                .await
                 {
                     Ok(Ok(v)) => v,
                     Ok(Err(err)) => {
