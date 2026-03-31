@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -379,48 +380,61 @@ pub async fn run_search_with_daemon(
 
     // Stream results using a channel: rayon workers extract snippets in parallel
     // and send results through a channel. The main thread prints as they arrive.
+    // Workers check `done` flag to stop early when the display limit is reached.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<source_fast_core::Snippet>)>(32);
 
     let query_for_workers = query.clone();
+    let done_for_workers = Arc::clone(&done);
     std::thread::spawn(move || {
         use rayon::prelude::*;
         hits.par_iter().for_each(|hit| {
+            if done_for_workers.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let path = PathBuf::from(&hit.path);
             let snippet = extract_snippet(&path, &query_for_workers)
                 .ok()
                 .flatten();
-            // Ignore send errors — receiver may have stopped early (limit reached).
-            let _ = tx.send((hit.path.clone(), snippet));
+            // Send error means receiver dropped (limit reached) — stop.
+            if tx.send((hit.path.clone(), snippet)).is_err() {
+                done_for_workers.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     });
 
     let mut printed = 0usize;
     let mut no_snippet_paths: Vec<String> = Vec::new();
 
-    for (path, snippet) in rx {
+    for (path, snippet) in &rx {
         match snippet {
             Some(snippet) => {
-                if printed < display_limit {
-                    let path_str = snippet.path.display().to_string();
-                    let display_path = clean_display_path(&path_str);
-                    println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
-                    for (line_no, line) in &snippet.lines {
-                        let truncated = truncate_line(line, 200);
-                        if line.contains(&query) {
-                            println!("\x1b[32m{line_no}\x1b[0m:{truncated}");
-                        } else {
-                            println!("\x1b[2m{line_no}\x1b[0m:{truncated}");
-                        }
+                let path_str = snippet.path.display().to_string();
+                let display_path = clean_display_path(&path_str);
+                println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
+                for (line_no, line) in &snippet.lines {
+                    let truncated = truncate_line(line, 200);
+                    if line.contains(&query) {
+                        println!("\x1b[32m{line_no}\x1b[0m:{truncated}");
+                    } else {
+                        println!("\x1b[2m{line_no}\x1b[0m:{truncated}");
                     }
-                    println!();
-                    printed += 1;
                 }
+                println!();
+                printed += 1;
             }
             None => {
                 no_snippet_paths.push(path);
             }
         }
+        // Stop once we have enough snippet + no-snippet results to fill the limit.
+        if printed + no_snippet_paths.len() >= display_limit {
+            break;
+        }
     }
+    // Signal workers to stop and drop the receiver so send() fails fast.
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(rx);
 
     // Print remaining no-snippet results at the end (up to the limit).
     for path in &no_snippet_paths {
