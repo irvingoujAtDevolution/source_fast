@@ -24,6 +24,11 @@ const MAP_SIZE: usize = 1024 * 1024 * 1024;
 const MAX_DBS: u32 = 6;
 const WRITER_LEADER_KEY: &str = "writer";
 
+/// Maximum batch size in bytes before the writer thread commits.
+/// Larger batches = fewer commits = faster bulk indexing.
+/// 64 MB is a good balance: ~4k files per batch on typical source code.
+const BATCH_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
 type FilesDb = Database<U32<NativeEndian>, Bytes>;
 type FilesByPathDb = Database<Str, U32<NativeEndian>>;
 type TrigramsDb = Database<Bytes, Bytes>;
@@ -78,6 +83,19 @@ enum IndexPayload {
         value: String,
     },
     Flush,
+}
+
+impl IndexPayload {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            IndexPayload::UpsertFile { path, trigrams, .. } => {
+                path.len() + trigrams.len() * 3 + 64 // 64 bytes overhead estimate
+            }
+            IndexPayload::RemoveFile { path } => path.len() + 64,
+            IndexPayload::SetMeta { key, value } => key.len() + value.len(),
+            IndexPayload::Flush => 0,
+        }
+    }
 }
 
 struct IndexJob {
@@ -671,12 +689,16 @@ fn writer_loop(
             }
         };
 
-        let mut batch = Vec::with_capacity(128);
+        let mut batch = Vec::with_capacity(4096);
+        let mut batch_bytes = first.payload.estimated_bytes();
         batch.push(first);
 
-        while batch.len() < 128 {
+        while batch_bytes < BATCH_MEMORY_LIMIT {
             match rx.try_recv() {
-                Ok(job) => batch.push(job),
+                Ok(job) => {
+                    batch_bytes += job.payload.estimated_bytes();
+                    batch.push(job);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     debug!("writer_loop channel disconnected while draining, processing remaining batch");

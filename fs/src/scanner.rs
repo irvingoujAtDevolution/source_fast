@@ -710,53 +710,54 @@ fn apply_changes_by_files_with_progress(
     let exclude_dir = root.join(".source_fast");
     let git_dir = root.join(".git");
 
-    let mut changed = 0usize;
+    // Collect candidates first so we can parallelize.
+    let candidates: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|path| {
+            path.starts_with(root)
+                && !path.starts_with(&exclude_dir)
+                && !path.starts_with(&git_dir)
+        })
+        .collect();
 
-    for path in files {
-        // Respect the requested root: only touch files under it.
-        if !path.starts_with(root) {
-            continue;
-        }
+    let changed = AtomicUsize::new(0);
 
-        // Skip our own index directory and the .git directory entirely.
-        if path.starts_with(&exclude_dir) || path.starts_with(&git_dir) {
-            continue;
-        }
-
+    candidates.par_iter().for_each(|path| {
         if path.exists() {
             if !path.is_file() {
-                continue;
+                return;
             }
             let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
             progress(ScanEvent::FileStarted(path.display().to_string()));
-            if let Err(err) = index.index_path(&path) {
+            if let Err(err) = index.index_path(path) {
                 warn!("smart_scan: failed to index path {}: {err}", path.display());
             } else {
-                changed += 1;
+                changed.fetch_add(1, Ordering::Relaxed);
             }
             progress(ScanEvent::FileFinished {
                 path: path.display().to_string(),
                 bytes,
             });
-        } else if let Err(err) = index.remove_path(&path) {
+        } else if let Err(err) = index.remove_path(path) {
             warn!(
                 "smart_scan: failed to remove path {} from index: {err}",
                 path.display()
             );
         } else {
-            changed += 1;
+            changed.fetch_add(1, Ordering::Relaxed);
             progress(ScanEvent::FileFinished {
                 path: path.display().to_string(),
                 bytes: 0,
             });
         }
-    }
+    });
 
-    if changed > 0 {
+    let total_changed = changed.load(Ordering::Relaxed);
+    if total_changed > 0 {
         index.flush()?;
         info!(
             "smart_scan: applied {} changes from unified candidate list",
-            changed
+            total_changed
         );
     } else {
         debug!("smart_scan: no changes to apply from unified candidate list");

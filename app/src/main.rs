@@ -8,8 +8,8 @@ mod mcp;
 
 use crate::cli::{
     default_db_path, default_root, init_tracing_cli, init_tracing_server,
-    run_file_search_with_daemon, run_list, run_search_with_daemon, run_status, run_stop,
-    run_stop_all,
+    run_file_search_with_daemon, run_index_build, run_index_watch, run_list,
+    run_search_with_daemon, run_status, run_stop, run_stop_all,
 };
 use crate::mcp::run_server;
 
@@ -41,6 +41,24 @@ enum DaemonCommand {
 enum IndexCommand {
     /// Show index build status for this repository.
     Status {
+        /// Root directory
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to database file
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Build the index for this repository. Starts a background daemon.
+    Build {
+        /// Root directory
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to database file
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Watch the indexing progress with a live display.
+    Watch {
         /// Root directory
         #[arg(long)]
         root: Option<PathBuf>,
@@ -204,6 +222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing_cli();
             match command {
                 IndexCommand::Status { root, db } => run_status(root, db).await?,
+                IndexCommand::Build { root, db } => run_index_build(root, db).await?,
+                IndexCommand::Watch { root, db } => run_index_watch(root, db).await?,
             }
         }
         Command::List => {

@@ -715,3 +715,152 @@ pub async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Index build & watch commands
+// ---------------------------------------------------------------------------
+
+pub async fn run_index_build(
+    root: Option<PathBuf>,
+    db: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = root.unwrap_or_else(default_root);
+    let db_path = db.unwrap_or_else(|| default_db_path(&root));
+
+    let was_running = daemon::ensure_daemon(&root, &db_path)?;
+    if was_running {
+        eprintln!("Daemon already running for {}", root.display());
+    } else {
+        eprintln!("Daemon started for {}", root.display());
+    }
+
+    if !daemon::wait_for_daemon(&db_path, Duration::from_secs(5)) {
+        eprintln!("Warning: daemon did not confirm in 5 s");
+    }
+
+    eprintln!("Index building in background. Use `sf index watch` to monitor progress.");
+    Ok(())
+}
+
+pub async fn run_index_watch(
+    root: Option<PathBuf>,
+    db: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = root.unwrap_or_else(default_root);
+    let db_path = db.unwrap_or_else(|| default_db_path(&root));
+
+    if !db_path.exists() {
+        eprintln!("No index found at {}. Run `sf index build` first.", db_path.display());
+        return Ok(());
+    }
+
+    let poll_interval = Duration::from_millis(100);
+    let mut last_line_len = 0usize;
+
+    loop {
+        let status = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_STATUS)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        let progress = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_PROGRESS)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<IndexProgress>(&json).ok());
+
+        let line = match &progress {
+            Some(p) => format_progress_line(p, &status),
+            None if status == "complete" => "\x1b[32m✓ Index complete.\x1b[0m".to_string(),
+            None if status == "failed" => "\x1b[31m✗ Index build failed.\x1b[0m".to_string(),
+            None => "Waiting for daemon...".to_string(),
+        };
+
+        // Overwrite the current line.
+        let padding = if line.len() < last_line_len {
+            " ".repeat(last_line_len - line.len())
+        } else {
+            String::new()
+        };
+        eprint!("\r{line}{padding}");
+        last_line_len = line.len();
+
+        if status == "complete" || status == "failed" {
+            eprintln!();
+            break;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    Ok(())
+}
+
+fn format_progress_line(p: &IndexProgress, status: &str) -> String {
+    let mode = p.mode.as_deref().unwrap_or("scanning");
+
+    let files_part = match p.total_files {
+        Some(total) if total > 0 => {
+            let pct = (p.processed_files as f64 / total as f64 * 100.0).min(100.0);
+            format!("{}/{} files ({pct:.0}%)", p.processed_files, total)
+        }
+        _ => format!("{} files", p.processed_files),
+    };
+
+    let bytes_part = match p.total_bytes {
+        Some(total) if total > 0 => {
+            format!(" {}/{}", format_bytes(p.processed_bytes), format_bytes(total))
+        }
+        _ if p.processed_bytes > 0 => format!(" {}", format_bytes(p.processed_bytes)),
+        _ => String::new(),
+    };
+
+    let bar = match p.total_files {
+        Some(total) if total > 0 => {
+            let ratio = (p.processed_files as f64 / total as f64).min(1.0);
+            let width = 30;
+            let filled = (ratio * width as f64) as usize;
+            let empty = width - filled;
+            format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty))
+        }
+        _ => String::new(),
+    };
+
+    let file_name = p
+        .current_path
+        .as_deref()
+        .or(p.last_completed_path.as_deref())
+        .map(|path| {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            if name.len() > 40 {
+                format!("{}...", &name[..37])
+            } else {
+                name.to_string()
+            }
+        })
+        .unwrap_or_default();
+
+    let eta = if status == "complete" {
+        " done".to_string()
+    } else {
+        match estimate_eta_seconds(p) {
+            Some(secs) => format!(" ETA {}", format_eta(secs)),
+            None => String::new(),
+        }
+    };
+
+    format!(
+        "\x1b[36m{mode}\x1b[0m{bar} {files_part}{bytes_part}{eta} \x1b[2m{file_name}\x1b[0m"
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
