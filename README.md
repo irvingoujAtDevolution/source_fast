@@ -42,7 +42,7 @@ sf index
 sf index --root /path/to/project
 ```
 
-The index is stored at `.source_fast/index.db` in the project root.
+The index is stored at `.source_fast/index.mdb/` in the project root.
 
 ### Search code
 

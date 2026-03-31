@@ -836,7 +836,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_index(dir: &Path) -> Arc<PersistentIndex> {
-        let db_path = dir.join(".source_fast").join("index.db");
+        let db_path = dir.join(".source_fast").join("index.mdb");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         Arc::new(PersistentIndex::open_or_create(&db_path).unwrap())
     }

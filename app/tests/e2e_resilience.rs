@@ -145,12 +145,6 @@ fn test_r4_corrupt_db_recovery() {
         }
     }
 
-    // Also remove any WAL/shm files
-    let wal_path = db_path.with_extension("db-wal");
-    let shm_path = db_path.with_extension("db-shm");
-    let _ = std::fs::remove_file(wal_path);
-    let _ = std::fs::remove_file(shm_path);
-
     // Search should recreate the database
     let output = fix.search("recoverable_content_r4");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -287,5 +281,96 @@ fn test_rapid_changes() {
     assert!(
         !stdout.contains("main.rs") || stdout.contains("No results"),
         "Old content should not be found"
+    );
+}
+
+/// Signal-file shutdown: writing .shutdown_requested causes daemon to exit.
+#[test]
+fn test_signal_file_shutdown() {
+    let fix = TestFixture::new();
+    fix.git_init();
+    fix.add_file("src/main.rs", "fn signal_test() {}");
+    fix.git_commit("initial");
+
+    // Start daemon via search
+    let _ = fix.search("signal_test");
+
+    // Verify daemon is running
+    let status_output = fix.status();
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        status_stdout.contains("Leader:") && !status_stdout.contains("none"),
+        "Daemon should be running: {}",
+        status_stdout
+    );
+
+    // Write shutdown signal file directly
+    let shutdown_file = fix.root().join(".source_fast").join(".shutdown_requested");
+    std::fs::write(&shutdown_file, "true").expect("Failed to write shutdown signal");
+
+    // Poll until daemon stops (up to 10s)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stopped = false;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(active) = source_fast_core::is_leader_active_readonly(&fix.db_path()) {
+            if !active {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    assert!(stopped, "Daemon should stop after signal file is written");
+}
+
+/// Multi-process LMDB: CLI can read while daemon writes.
+#[test]
+fn test_concurrent_cli_reads_while_daemon_runs() {
+    let fix = TestFixture::new();
+    fix.git_init();
+    fix.add_file("src/main.rs", "fn concurrent_test_marker() {}");
+    fix.add_file("src/lib.rs", "fn lib_marker() {}");
+    fix.git_commit("initial");
+
+    // Start daemon and wait for index to complete
+    let output = fix.search("concurrent_test_marker");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main.rs"), "Initial search should work");
+
+    // While daemon is still running, do multiple CLI operations
+    let status_output = fix.status();
+    assert!(
+        status_output.status.success(),
+        "sf status should succeed while daemon runs"
+    );
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        status_stdout.contains("complete"),
+        "Index should be complete: {}",
+        status_stdout
+    );
+
+    let search_output = fix.search("lib_marker");
+    assert!(
+        search_output.status.success(),
+        "sf search should succeed while daemon runs"
+    );
+    let search_stdout = String::from_utf8_lossy(&search_output.stdout);
+    assert!(
+        search_stdout.contains("lib.rs"),
+        "Should find lib.rs: {}",
+        search_stdout
+    );
+
+    let file_output = fix.search_file("main");
+    assert!(
+        file_output.status.success(),
+        "sf search-file should succeed while daemon runs"
+    );
+    let file_stdout = String::from_utf8_lossy(&file_output.stdout);
+    assert!(
+        file_stdout.contains("main.rs"),
+        "Should find main.rs: {}",
+        file_stdout
     );
 }

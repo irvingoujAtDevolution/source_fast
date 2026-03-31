@@ -41,9 +41,9 @@ impl TestFixture {
         self.dir.path().to_path_buf()
     }
 
-    /// Get the expected db path (.source_fast/index.db)
+    /// Get the expected db path (.source_fast/index.mdb)
     pub fn db_path(&self) -> PathBuf {
-        self.root().join(".source_fast").join("index.db")
+        self.root().join(".source_fast").join("index.mdb")
     }
 
     // ============ File Operations ============
@@ -230,7 +230,7 @@ impl Drop for TestFixture {
             .arg(self.dir.path())
             .output();
         // Wait for daemon to release DB files. Poll leader table if DB exists.
-        let db_path = self.dir.path().join(".source_fast").join("index.db");
+        let db_path = self.dir.path().join(".source_fast").join("index.mdb");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(200));

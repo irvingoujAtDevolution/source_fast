@@ -66,6 +66,9 @@ enum Command {
         /// Block until the index is fully built before returning results
         #[arg(long)]
         wait: bool,
+        /// Maximum number of results to display (0 for unlimited)
+        #[arg(long, default_value = "20")]
+        limit: usize,
         /// Search query
         query: String,
     },
@@ -106,6 +109,7 @@ enum Command {
         db: Option<PathBuf>,
     },
     /// Daemon management commands.
+    // Intentional typo-tolerant alias for users who misspell "daemon".
     #[command(visible_alias = "deamon")]
     Daemon {
         #[command(subcommand)]
@@ -161,10 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             db,
             file_regex,
             wait,
+            limit,
             query,
         } => {
             init_tracing_cli();
-            run_search_with_daemon(root, db, query, file_regex, wait).await?;
+            run_search_with_daemon(root, db, query, file_regex, wait, limit).await?;
         }
         Command::SearchFile {
             root,

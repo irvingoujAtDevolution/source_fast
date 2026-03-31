@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn db_path(root: &Path) -> PathBuf {
-    root.join(".source_fast").join("index.db")
+    root.join(".source_fast").join("index.mdb")
 }
 
 /// Trigger daemon start + full indexing via `sf search --wait`.
@@ -405,7 +405,8 @@ fn test_wt9_corrupted_db_rebuilds() {
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
-    std::fs::write(&db, b"not a sqlite db").unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("data.mdb"), b"not an lmdb db").unwrap();
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "corrupt_unique_wt9", "main.rs");
@@ -431,11 +432,8 @@ fn test_wt10_missing_schema_rebuilds() {
         std::fs::create_dir_all(parent).unwrap();
     }
 
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS dummy (id INTEGER);")
-            .unwrap();
-    }
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("data.mdb"), b"missing schema placeholder").unwrap();
 
     sf_index(worktree_root);
     assert_search_contains(worktree_root, "schema_unique_wt10", "main.rs");
@@ -712,12 +710,11 @@ fn test_wt20_copy_failure_fallbacks_to_full_scan() {
     fix.add_file("src/main.rs", "fn copy_fail_wt20() {}");
     fix.git_commit("initial");
 
-    let source_db = fix.root().join(".source_fast").join("index.db");
+    let source_db = fix.root().join(".source_fast").join("index.mdb");
     if let Some(parent) = source_db.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     if source_db.exists() {
-        std::fs::remove_file(&source_db).ok();
         std::fs::remove_dir_all(&source_db).ok();
     }
     std::fs::create_dir_all(&source_db).unwrap();

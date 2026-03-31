@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use source_fast_progress::{IndexProgress, ScanEvent};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-/// Meta keys used for daemon IPC via SQLite.
+/// Meta keys used for daemon IPC via LMDB metadata.
 pub mod meta_keys {
     pub const SHUTDOWN_REQUESTED: &str = "shutdown_requested";
     pub const INDEX_STATUS: &str = "index_status";
@@ -86,11 +86,7 @@ fn init_daemon_tracing(db_path: &Path) {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
+    source_fast_core::now_millis().max(0) as u64
 }
 
 fn persist_progress(index: &PersistentIndex, progress: &IndexProgress) {
@@ -99,25 +95,15 @@ fn persist_progress(index: &PersistentIndex, progress: &IndexProgress) {
     }
 }
 
-fn open_meta_conn(db_path: &Path) -> Option<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(db_path).ok()?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    Some(conn)
-}
-
-fn write_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value],
-    )?;
-    Ok(())
+fn shutdown_signal_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(".shutdown_requested")
 }
 
 struct ProgressWriter {
-    db_path: PathBuf,
-    conn: Option<rusqlite::Connection>,
+    index: Arc<PersistentIndex>,
     last_json: Option<String>,
     last_persist_at: Option<Instant>,
 }
@@ -125,10 +111,9 @@ struct ProgressWriter {
 impl ProgressWriter {
     const MIN_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
 
-    fn new(db_path: &Path) -> Self {
+    fn new(index: Arc<PersistentIndex>) -> Self {
         Self {
-            db_path: db_path.to_path_buf(),
-            conn: open_meta_conn(db_path),
+            index,
             last_json: None,
             last_persist_at: None,
         }
@@ -157,15 +142,9 @@ impl ProgressWriter {
     }
 
     fn try_write(&mut self, json: &str) -> Option<()> {
-        if let Some(conn) = self.conn.as_ref()
-            && write_meta(conn, meta_keys::INDEX_PROGRESS, json).is_ok()
-        {
-            return Some(());
-        }
-
-        self.conn = open_meta_conn(&self.db_path);
-        let conn = self.conn.as_ref()?;
-        write_meta(conn, meta_keys::INDEX_PROGRESS, json).ok()?;
+        self.index
+            .set_meta_queued(meta_keys::INDEX_PROGRESS, json)
+            .ok()?;
         Some(())
     }
 }
@@ -210,14 +189,21 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
 
     loop {
         // ---- Graceful shutdown check ----
+        let shutdown_file = shutdown_signal_path(&db_path);
+        if shutdown_file.exists() {
+            let _ = std::fs::remove_file(&shutdown_file);
+            info!("daemon: shutdown requested via signal file, exiting gracefully");
+            break;
+        }
         if let Ok(Some(val)) = index.get_meta(meta_keys::SHUTDOWN_REQUESTED) {
             if val == "true" {
-                info!("daemon: shutdown requested, exiting gracefully");
+                info!("daemon: shutdown requested via meta, exiting gracefully");
                 break;
             }
         }
 
-        // ---- Leader election (replicates mcp.rs lines 168-196) ----
+        // ---- Leader election ----
+        // TODO: extract shared election/writer lifecycle into a reusable helper (duplicated in mcp.rs)
         if !is_writer.load(Ordering::SeqCst) {
             let idx = Arc::clone(&index);
             let holder_clone = holder.clone();
@@ -258,6 +244,7 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
 
                 // Kick off initial scan.
                 let index_for_scan = Arc::clone(&index);
+                let index_for_status = Arc::clone(&index);
                 let root_for_scan = root.clone();
                 let ready_for_scan = Arc::clone(&index_ready);
                 let index_for_progress = Arc::clone(&index);
@@ -265,7 +252,7 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                     let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
                     let progress_thread = std::thread::spawn(move || {
                         let mut progress = IndexProgress::building(now_ms());
-                        let mut progress_writer = ProgressWriter::new(index_for_progress.db_path());
+                        let mut progress_writer = ProgressWriter::new(index_for_progress);
                         progress_writer.persist(&progress, true);
                         loop {
                             match progress_rx.recv_timeout(Duration::from_millis(500)) {
@@ -305,12 +292,14 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                             let _ = final_progress_tx.send(ScanEvent::Failed);
                             drop(final_progress_tx);
                             let _ = progress_thread.join();
+                            let _ = index_for_status.set_meta(meta_keys::INDEX_STATUS, "failed");
                             error!("daemon: initial index build failed: {err}");
                         }
                         Err(join_err) => {
                             let _ = final_progress_tx.send(ScanEvent::Failed);
                             drop(final_progress_tx);
                             let _ = progress_thread.join();
+                            let _ = index_for_status.set_meta(meta_keys::INDEX_STATUS, "failed");
                             error!("daemon: initial index task panicked: {join_err}");
                         }
                     }
@@ -366,6 +355,10 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
             };
 
             if !renewed {
+                // TODO: cancel outstanding scan/watcher tasks from the previous
+                // writer generation to avoid resource leaks on lease flip-flop.
+                // Requires passing a cancellation flag to smart_scan_with_progress
+                // and background_watcher.
                 index.set_write_enabled(false);
                 is_writer.store(false, Ordering::SeqCst);
                 writer_started = false;
@@ -381,6 +374,8 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
     // false immediately (no need to wait for TTL expiry).
     let _ = index.release_writer_lease(&holder);
     let _ = deregister_daemon(&root);
+    let shutdown_file = shutdown_signal_path(&db_path);
+    let _ = std::fs::remove_file(&shutdown_file);
     info!("daemon exiting");
     Ok(())
 }
@@ -478,54 +473,68 @@ pub fn spawn_daemon(root: &Path, db_path: &Path) -> Result<(), Box<dyn std::erro
 /// Ensure a daemon is running for the given repo root.
 /// Returns `Ok(true)` if a daemon was already running, `Ok(false)` if we spawned one.
 pub fn ensure_daemon(root: &Path, db_path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    info!(root = %root.display(), db = %db_path.display(), "ensuring daemon availability");
+
+    // Acquire a spawn lock to prevent two CLI processes from racing to spawn daemons.
+    let lock_dir = db_path.parent().unwrap_or(Path::new("."));
+    let _ = std::fs::create_dir_all(lock_dir);
+    let lock_path = lock_dir.join(".spawn.lock");
+    let lock_file = std::fs::File::create(&lock_path)?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    if lock.try_write().is_err() {
+        // Another process is already spawning. Wait briefly and check leader.
+        std::thread::sleep(Duration::from_secs(1));
+        if source_fast_core::is_leader_active_readonly(db_path).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    let _guard = lock.write()?;
+
     // If the DB doesn't exist yet, create it so the daemon can open it.
     if !db_path.exists() {
-        let _ = crate::cli::open_index_with_worktree_copy(root, db_path)?;
+        info!(root = %root.display(), db = %db_path.display(), "index database missing, creating initial environment before spawning daemon");
+        let index = crate::cli::open_index_with_worktree_copy(root, db_path)?;
+        drop(index);
         spawn_daemon(root, db_path)?;
         return Ok(false);
     }
 
-    // Existing DBs still need the worktree-copy/corruption recovery path.
-    // WT9 exercises the case where the worktree DB exists but contains
-    // invalid SQLite bytes; opening directly would fail before recovery runs.
-    let index = crate::cli::open_index_with_worktree_copy(root, db_path)?;
-
     // Version mismatch: stop old daemon, wait, then spawn new one.
-    if let Ok(Some(ver)) = index.get_meta(meta_keys::DAEMON_VERSION) {
+    if let Ok(Some(ver)) = source_fast_core::read_meta_readonly(db_path, meta_keys::DAEMON_VERSION)
+    {
         if ver != env!("CARGO_PKG_VERSION") {
             info!(
                 old_version = %ver,
                 new_version = env!("CARGO_PKG_VERSION"),
                 "daemon version mismatch, restarting"
             );
-            let _ = stop_daemon(db_path);
-            std::thread::sleep(Duration::from_secs(2));
+            let shutdown_file = shutdown_signal_path(db_path);
+            let _ = std::fs::write(&shutdown_file, "true");
+            // Poll until the old daemon releases the lease, up to 5 seconds.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if !source_fast_core::is_leader_active_readonly(db_path).unwrap_or(true) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 
     // Check if a leader (daemon or MCP server) is already active.
-    if index.is_leader_active()? {
+    if source_fast_core::is_leader_active_readonly(db_path)? {
+        info!(db = %db_path.display(), "leader already active, reusing existing daemon");
         return Ok(true);
     }
 
-    // Clear stale shutdown request and index_status before spawning so that
-    // `--wait` doesn't see the old daemon's "complete" and return prematurely.
-    let _ = index.set_meta(meta_keys::SHUTDOWN_REQUESTED, "false");
-    let _ = index.set_meta(meta_keys::INDEX_STATUS, index_status::BUILDING);
+    info!(db = %db_path.display(), "no active leader found, marking index as building and spawning daemon");
+    {
+        let index = crate::cli::open_index_with_worktree_copy(root, db_path)?;
+        let _ = index.set_meta(meta_keys::INDEX_STATUS, index_status::BUILDING);
+    }
 
     spawn_daemon(root, db_path)?;
     Ok(false)
-}
-
-/// Open a lightweight SQLite connection for polling.
-/// Unlike `PersistentIndex::open_or_create`, this does NOT run `init_schema`
-/// or load file IDs, avoiding write contention with the daemon.
-fn open_poll_conn(db_path: &Path) -> Option<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(db_path).ok()?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
-    // Ensure we can read WAL data (daemon writes in WAL mode).
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    Some(conn)
 }
 
 /// Wait for the daemon to become active (leader acquired).
@@ -533,27 +542,53 @@ fn open_poll_conn(db_path: &Path) -> Option<rusqlite::Connection> {
 pub fn wait_for_daemon(db_path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let mut next_heartbeat = Duration::ZERO;
 
     while start.elapsed() < timeout {
-        if let Some(conn) = open_poll_conn(db_path) {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let active: bool = conn
-                .query_row(
-                    "SELECT 1 FROM leader WHERE name = 'writer' AND expires_at_ms > ?1",
-                    [now_ms],
-                    |_row| Ok(true),
-                )
-                .unwrap_or(false);
-            if active {
+        match source_fast_core::read_leader_readonly(db_path) {
+            Ok(Some((holder, expires_ms))) => {
+                info!(
+                    db = %db_path.display(),
+                    leader_holder = %holder,
+                    expires_ms,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "daemon leadership confirmed"
+                );
                 return true;
             }
+            Ok(None) => {}
+            Err(err) => {
+                debug!(
+                    db = %db_path.display(),
+                    error = %err,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "daemon readiness check could not read leader state yet"
+                );
+            }
+        }
+
+        if start.elapsed() >= next_heartbeat {
+            let index_status = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_STATUS)
+                .ok()
+                .flatten();
+            debug!(
+                db = %db_path.display(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                timeout_ms = timeout.as_millis() as u64,
+                index_status = ?index_status,
+                "waiting for daemon leadership"
+            );
+            next_heartbeat += Duration::from_secs(1);
         }
         std::thread::sleep(poll_interval);
     }
 
+    warn!(
+        db = %db_path.display(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        timeout_ms = timeout.as_millis() as u64,
+        "timed out waiting for daemon leadership"
+    );
     false
 }
 
@@ -562,23 +597,52 @@ pub fn wait_for_daemon(db_path: &Path, timeout: Duration) -> bool {
 pub fn wait_for_index_complete(db_path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(500);
+    let mut next_heartbeat = Duration::ZERO;
 
     while start.elapsed() < timeout {
-        if let Some(conn) = open_poll_conn(db_path) {
-            let status: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key = ?1",
-                    [meta_keys::INDEX_STATUS],
-                    |row| row.get(0),
-                )
-                .ok();
-            if status.as_deref() == Some(index_status::COMPLETE) {
-                return true;
-            }
+        let index_status = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_STATUS)
+            .ok()
+            .flatten();
+        if index_status.as_deref() == Some(index_status::COMPLETE) {
+            info!(
+                db = %db_path.display(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "index completion confirmed"
+            );
+            return true;
+        }
+        if index_status.as_deref() == Some("failed") {
+            warn!(
+                db = %db_path.display(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "index build failed, not waiting further"
+            );
+            return false;
+        }
+
+        if start.elapsed() >= next_heartbeat {
+            let progress = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_PROGRESS)
+                .ok()
+                .flatten();
+            debug!(
+                db = %db_path.display(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                timeout_ms = timeout.as_millis() as u64,
+                index_status = ?index_status,
+                progress = ?progress,
+                "waiting for index completion"
+            );
+            next_heartbeat += Duration::from_secs(2);
         }
         std::thread::sleep(poll_interval);
     }
 
+    warn!(
+        db = %db_path.display(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        timeout_ms = timeout.as_millis() as u64,
+        "timed out waiting for index completion"
+    );
     false
 }
 
@@ -593,47 +657,65 @@ pub fn stop_daemon(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let index = PersistentIndex::open_or_create(db_path)?;
-    index.set_meta(meta_keys::SHUTDOWN_REQUESTED, "true")?;
-    info!(db = %db_path.display(), "shutdown request written");
+    let shutdown_file = shutdown_signal_path(db_path);
+    std::fs::write(&shutdown_file, "true")?;
+    info!(db = %db_path.display(), signal = %shutdown_file.display(), "shutdown request written via signal file");
     Ok(())
 }
 
 /// Read status of the daemon for the given repo.
 pub fn daemon_status(db_path: &Path) -> Result<Option<DaemonInfo>, Box<dyn std::error::Error>> {
     if !db_path.exists() {
+        debug!(db = %db_path.display(), "daemon status requested but database directory does not exist");
         return Ok(None);
     }
 
-    let index = PersistentIndex::open_or_create(db_path)?;
-
-    let leader_info = index.read_leader_info()?;
-    let pid = index
-        .get_meta(meta_keys::DAEMON_PID)?
+    let leader_info = source_fast_core::read_leader_readonly(db_path)?;
+    let pid = source_fast_core::read_meta_readonly(db_path, meta_keys::DAEMON_PID)?
         .and_then(|s| s.parse::<u32>().ok());
-    let version = index.get_meta(meta_keys::DAEMON_VERSION)?;
-    let idx_status = index.get_meta(meta_keys::INDEX_STATUS)?;
-    let progress = index
-        .get_meta(meta_keys::INDEX_PROGRESS)?
+    let version = source_fast_core::read_meta_readonly(db_path, meta_keys::DAEMON_VERSION)?;
+    let idx_status = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_STATUS)?;
+    let progress = source_fast_core::read_meta_readonly(db_path, meta_keys::INDEX_PROGRESS)?
         .and_then(|json| serde_json::from_str(&json).ok());
 
     if leader_info.is_none() && pid.is_none() {
+        debug!(db = %db_path.display(), "daemon status found no leader and no recorded pid");
         return Ok(None);
     }
 
-    Ok(Some(DaemonInfo {
-        root: db_path
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new("."))
-            .to_path_buf(),
+    // Try to find the root from the registry first; fall back to parent traversal.
+    let db_path_str = db_path.display().to_string();
+    let registry_root = read_registry()
+        .into_iter()
+        .find(|e| e.db_path == db_path_str)
+        .map(|e| PathBuf::from(e.root));
+    let info = DaemonInfo {
+        root: registry_root.unwrap_or_else(|| {
+            db_path
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        }),
         pid,
         version,
         index_status: idx_status,
         progress,
         leader_holder: leader_info.as_ref().map(|(h, _)| h.clone()),
         leader_expires_ms: leader_info.map(|(_, e)| e),
-    }))
+    };
+
+    debug!(
+        root = %info.root.display(),
+        db = %db_path.display(),
+        pid = ?info.pid,
+        version = ?info.version,
+        index_status = ?info.index_status,
+        leader_holder = ?info.leader_holder,
+        "daemon status loaded"
+    );
+
+    Ok(Some(info))
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +727,18 @@ fn daemons_json_path() -> PathBuf {
     let dir = home.join(".source_fast");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("daemons.json")
+}
+
+/// Helper: run a closure while holding the registry lock.
+fn with_registry_lock<F, R>(f: F) -> std::io::Result<R>
+where
+    F: FnOnce() -> std::io::Result<R>,
+{
+    let lock_path = daemons_json_path().with_extension("lock");
+    let file = std::fs::File::create(lock_path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let _guard = lock.write()?;
+    f()
 }
 
 fn read_registry() -> Vec<DaemonEntry> {
@@ -664,27 +758,28 @@ fn write_registry(entries: &[DaemonEntry]) -> std::io::Result<()> {
 
 /// Register a daemon in the global registry.
 fn register_daemon(root: &Path, db_path: &Path, pid: u32) -> std::io::Result<()> {
-    let mut entries = read_registry();
     let root_str = root.display().to_string();
-
-    // Remove stale entry for the same root.
-    entries.retain(|e| e.root != root_str);
-
-    entries.push(DaemonEntry {
-        root: root_str,
-        db_path: db_path.display().to_string(),
-        pid,
-    });
-
-    write_registry(&entries)
+    let db_path_str = db_path.display().to_string();
+    with_registry_lock(|| {
+        let mut entries = read_registry();
+        entries.retain(|e| e.root != root_str);
+        entries.push(DaemonEntry {
+            root: root_str.clone(),
+            db_path: db_path_str.clone(),
+            pid,
+        });
+        write_registry(&entries)
+    })
 }
 
 /// Remove a daemon from the global registry.
 fn deregister_daemon(root: &Path) -> std::io::Result<()> {
-    let mut entries = read_registry();
     let root_str = root.display().to_string();
-    entries.retain(|e| e.root != root_str);
-    write_registry(&entries)
+    with_registry_lock(|| {
+        let mut entries = read_registry();
+        entries.retain(|e| e.root != root_str);
+        write_registry(&entries)
+    })
 }
 
 /// List all known daemons from the global registry, validating each entry.
@@ -694,11 +789,13 @@ pub fn list_all_daemons() -> Result<Vec<DaemonInfo>, Box<dyn std::error::Error>>
 
     for entry in &entries {
         let db = PathBuf::from(&entry.db_path);
-        match daemon_status(&db)? {
-            Some(info) => result.push(info),
-            None => {
-                // Stale entry — daemon is gone. We don't remove here to avoid
-                // file-locking complexity; `sf stop --all` cleans up.
+        match daemon_status(&db) {
+            Ok(Some(info)) => result.push(info),
+            Ok(None) => {
+                // Stale entry — daemon is gone.
+            }
+            Err(err) => {
+                warn!(db = %db.display(), error = %err, "skipping stale daemon registry entry");
             }
         }
     }

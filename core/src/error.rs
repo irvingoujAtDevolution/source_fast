@@ -1,7 +1,6 @@
 use std::io;
 
 use bincode::error::{DecodeError, EncodeError};
-use rusqlite::Error as SqliteError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,10 +9,13 @@ pub enum IndexError {
     Io(#[from] io::Error),
 
     #[error("database error: {0}")]
-    Db(#[from] SqliteError),
+    Db(String),
 
     #[error("encode error: {0}")]
     Encode(String),
+
+    #[error("decode error: {0}")]
+    Decode(String),
 }
 
 impl From<EncodeError> for IndexError {
@@ -24,7 +26,13 @@ impl From<EncodeError> for IndexError {
 
 impl From<DecodeError> for IndexError {
     fn from(err: DecodeError) -> Self {
-        IndexError::Encode(err.to_string())
+        IndexError::Decode(err.to_string())
+    }
+}
+
+impl From<heed::Error> for IndexError {
+    fn from(err: heed::Error) -> Self {
+        IndexError::Db(err.to_string())
     }
 }
 

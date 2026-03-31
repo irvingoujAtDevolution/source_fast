@@ -51,7 +51,7 @@ You should pass this list to your Coding Agent. It is organized by **complexity*
 | **R1** | **Interruption** | Start indexing a HUGE repo. Hit `Ctrl+C` halfway. Run `sf index` again. | Second run should detect mismatched Git Hash and resume/finish indexing correctly. |
 | **R2** | **History Rewrite** | `git rebase -i` (Change old commit hashes). Run `sf index`. | Tool detects stored hash is missing from Git history. Triggers **Full Re-scan**. State corrects itself. |
 | **R3** | **Locked DB** | Start `sf server` (Server Mode). In another terminal, try `sf index` (CLI Mode). | CLI should error gracefully ("Database Locked") or wait 5s, not panic. |
-| **R4** | **Corrupt DB** | Delete `.source_fast/index.db`. Run `sf index`. | Should transparently recreate DB and full index. |
+| **R4** | **Corrupt DB** | Delete `.source_fast/index.mdb/`. Run `sf index`. | Should transparently recreate DB and full index. |
 
 ---
 

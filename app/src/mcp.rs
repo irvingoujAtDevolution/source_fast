@@ -153,6 +153,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
             .as_nanos();
         format!("pid:{}:{nanos}", std::process::id())
     };
+    let holder_for_cleanup = holder.clone();
     let lease_ttl = Duration::from_secs(5);
     let election_index = Arc::clone(&index);
     let election_root = root.clone();
@@ -160,6 +161,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
     let is_writer = Arc::new(AtomicBool::new(false));
     let is_writer_for_task = Arc::clone(&is_writer);
 
+    // TODO: extract shared election/writer lifecycle into a reusable helper (duplicated in daemon.rs)
     task::spawn(async move {
         let mut role_logged: Option<&'static str> = None;
         let mut writer_started = false;
@@ -268,7 +270,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
     });
 
     // Start rmcp-based MCP server on stdio.
-    let server = SearchServer::new(index, index_ready);
+    let server = SearchServer::new(index.clone(), index_ready);
 
     let service = server
         .serve(stdio())
@@ -276,6 +278,10 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
         .inspect_err(|e| error!("source_fast MCP serve error: {e:?}"))?;
 
     service.waiting().await?;
+
+    // Release the writer lease so other processes can acquire it immediately.
+    let _ = index.release_writer_lease(&holder_for_cleanup);
+    info!("MCP server shut down, writer lease released");
 
     Ok(())
 }

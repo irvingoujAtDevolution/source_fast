@@ -17,6 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bincode = { version = "2.0", default-features = false, features = ["serde", "alloc", "std"] }
 rmcp = { version = "0.10", features = ["server", "transport-io", "macros"] }
 schemars = "1.1"
 source_fast_core = { path = "../core" }
@@ -26,7 +27,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.11"
 dirs = "6"
-rusqlite = { version = "0.37", features = ["bundled"] }
+fd-lock = "4"
+heed = "0.20"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -36,4 +38,5 @@ assert_cmd = "2.0"
 assert_fs = "1.1"
 predicates = "3.1"
 insta = { version = "1.40", features = ["json"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+
+[target.'cfg(windows)'.build-dependencies]

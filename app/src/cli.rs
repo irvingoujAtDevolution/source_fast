@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use source_fast_core::{
-    IndexError, PersistentIndex, rewrite_root_paths, search_database_file_with_snippets_filtered,
-    search_files_in_database,
+    IndexError, PersistentIndex, read_meta_readonly, rewrite_root_paths,
+    search_database_file_with_snippets_filtered, search_files_in_database,
 };
 use source_fast_progress::IndexProgress;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::daemon;
 
@@ -23,8 +23,26 @@ pub fn default_db_path(root: &Path) -> PathBuf {
     let mut dir = root.to_path_buf();
     dir.push(".source_fast");
     let _ = std::fs::create_dir_all(&dir);
-    dir.push("index.db");
+    dir.push("index.mdb");
     dir
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+/// Strip the `\\?\` extended path prefix that Windows canonicalization adds.
+fn clean_display_path(path: &str) -> &str {
+    path.strip_prefix(r"\\?\").unwrap_or(path)
+}
+
+/// Truncate a line to `max_chars` characters, appending `...` if truncated.
+fn truncate_line(line: &str, max_chars: usize) -> String {
+    if line.len() <= max_chars {
+        line.to_string()
+    } else {
+        format!("{}...", &line[..max_chars])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -32,16 +50,17 @@ pub fn default_db_path(root: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn remove_db_files(db_path: &Path) {
-    let wal = db_path.with_extension("db-wal");
-    let shm = db_path.with_extension("db-shm");
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(wal);
-    let _ = std::fs::remove_file(shm);
+    let _ = std::fs::remove_dir_all(db_path);
 }
 
 fn is_corrupt_db(err: &IndexError) -> bool {
     match err {
-        IndexError::Db(db_err) => db_err.to_string().contains("file is not a database"),
+        IndexError::Db(db_err) => {
+            db_err.contains("Invalid")
+                || db_err.contains("corrupted")
+                || db_err.contains("MDB_INVALID")
+                || db_err.contains("MDB_VERSION_MISMATCH")
+        }
         _ => false,
     }
 }
@@ -79,8 +98,15 @@ fn same_path(lhs: &Path, rhs: &Path) -> bool {
     }
 }
 
+/// Copy the LMDB data file from `source_root`'s index to `db_path`.
+/// Only copies `data.mdb` (not `lock.mdb` which is process-local).
+///
+/// SAFETY: This copies the LMDB data file directly without coordinating with
+/// any active writer. Only safe when no daemon is running on `source_root`'s
+/// database, or when the caller accepts a snapshot-in-time copy (LMDB's
+/// data.mdb is always in a committed-consistent state on disk).
 fn copy_db_from_root(source_root: &Path, db_path: &Path) -> std::io::Result<bool> {
-    let source_db = source_root.join(".source_fast").join("index.db");
+    let source_db = source_root.join(".source_fast").join("index.mdb");
     if !source_db.exists() {
         return Ok(false);
     }
@@ -89,18 +115,10 @@ fn copy_db_from_root(source_root: &Path, db_path: &Path) -> std::io::Result<bool
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::copy(&source_db, db_path)?;
-
-    let source_wal = source_db.with_extension("db-wal");
-    let source_shm = source_db.with_extension("db-shm");
-    let dest_wal = db_path.with_extension("db-wal");
-    let dest_shm = db_path.with_extension("db-shm");
-
-    if source_wal.exists() {
-        let _ = std::fs::copy(&source_wal, &dest_wal);
-    }
-    if source_shm.exists() {
-        let _ = std::fs::copy(&source_shm, &dest_shm);
+    std::fs::create_dir_all(db_path)?;
+    let source_data = source_db.join("data.mdb");
+    if source_data.exists() {
+        std::fs::copy(&source_data, db_path.join("data.mdb"))?;
     }
 
     Ok(true)
@@ -162,16 +180,45 @@ pub(crate) fn open_index_with_worktree_copy(
 // ---------------------------------------------------------------------------
 
 /// Initialize tracing for CLI commands (search/stop/status).
-/// Logs go to stderr, and respect RUST_LOG or default to `info`.
+///
+/// Log destination is controlled by `SOURCE_FAST_LOG_PATH`:
+/// - If set, logs go to that file (append mode).
+/// - If unset, tracing is effectively disabled (no stderr noise).
+///
+/// Log level is controlled by `RUST_LOG` (default: `info`).
 pub fn init_tracing_cli() {
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
     use tracing_subscriber::{EnvFilter, fmt};
+
+    let path = match std::env::var("SOURCE_FAST_LOG_PATH") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => return, // No log path → no tracing output
+    };
+
+    if OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .is_err()
+    {
+        return;
+    }
+
+    let make_writer = move || {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("failed to open SOURCE_FAST_LOG_PATH for logging")
+    };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(make_writer)
         .init();
 }
 
@@ -226,7 +273,9 @@ pub async fn run_search_with_daemon(
     query: String,
     file_regex: Option<String>,
     wait: bool,
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let command_started = Instant::now();
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
@@ -243,16 +292,40 @@ pub async fn run_search_with_daemon(
     };
 
     let first_time = !db_path.exists();
+    info!(
+        root = %root.display(),
+        db = %db_path.display(),
+        query = %query,
+        file_regex = ?file_regex.as_ref().map(|re| re.as_str()),
+        wait,
+        first_time,
+        "search command starting"
+    );
 
     // Ensure a daemon (or MCP server) is keeping the index warm.
+    let ensure_started = Instant::now();
     let was_running = daemon::ensure_daemon(&root, &db_path)?;
+    info!(
+        root = %root.display(),
+        db = %db_path.display(),
+        was_running,
+        elapsed_ms = ensure_started.elapsed().as_millis() as u64,
+        "ensure_daemon finished for search command"
+    );
 
     if first_time {
         eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
     }
 
     if !was_running {
+        let daemon_wait_started = Instant::now();
         let confirmed = daemon::wait_for_daemon(&db_path, Duration::from_secs(3));
+        info!(
+            db = %db_path.display(),
+            confirmed,
+            elapsed_ms = daemon_wait_started.elapsed().as_millis() as u64,
+            "daemon readiness wait finished for search command"
+        );
         if !confirmed {
             warn!("Daemon did not confirm in 3 s, proceeding with search anyway");
         }
@@ -260,52 +333,100 @@ pub async fn run_search_with_daemon(
 
     // If --wait, block until index is complete.
     if wait {
-        if !daemon::wait_for_index_complete(&db_path, Duration::from_secs(120)) {
+        let index_wait_started = Instant::now();
+        let complete = daemon::wait_for_index_complete(&db_path, Duration::from_secs(120));
+        info!(
+            db = %db_path.display(),
+            complete,
+            elapsed_ms = index_wait_started.elapsed().as_millis() as u64,
+            "index completion wait finished for search command"
+        );
+        if !complete {
             eprintln!("Timed out waiting for index to complete (120 s).");
         }
     }
 
     if !db_path.exists() {
         // DB hasn't been created yet (daemon just started). Nothing to search.
+        info!(
+            db = %db_path.display(),
+            elapsed_ms = command_started.elapsed().as_millis() as u64,
+            "search command finished before database directory was created"
+        );
         return Ok(());
     }
 
     // Check completeness for the disclaimer.
-    let index = PersistentIndex::open_or_create(&db_path)?;
-    if let Ok(Some(status)) = index.get_meta(daemon::meta_keys::INDEX_STATUS) {
+    if let Ok(Some(status)) = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_STATUS) {
+        debug!(db = %db_path.display(), index_status = %status, "search command observed index status");
         if status != daemon::index_status::COMPLETE {
             eprintln!("Note: index is still building. Results may be incomplete.");
         }
     }
-    drop(index);
 
     // Execute the search.
     let results =
         match search_database_file_with_snippets_filtered(&db_path, &query, file_regex.as_ref()) {
             Ok(r) => r,
             Err(err) => {
-                error!("Search failed: {:?}", err);
+                error!(db = %db_path.display(), query = %query, error = ?err, "search command failed");
                 std::process::exit(1);
             }
         };
 
+    info!(
+        db = %db_path.display(),
+        query = %query,
+        results = results.len(),
+        elapsed_ms = command_started.elapsed().as_millis() as u64,
+        "search command completed"
+    );
+
+    // Sort: results with snippets first, then by path.
+    let mut with_snippet = Vec::new();
+    let mut without_snippet = Vec::new();
     for result in results {
-        let path = PathBuf::from(&result.path);
-
-        if let Some(err) = result.snippet_error.as_ref() {
-            warn!(path = %path.display(), error = %err, "Failed to extract snippet");
+        if result.snippet.is_some() {
+            with_snippet.push(result);
+        } else {
+            without_snippet.push(result);
         }
+    }
+    with_snippet.sort_by(|a, b| a.path.cmp(&b.path));
+    without_snippet.sort_by(|a, b| a.path.cmp(&b.path));
 
-        match result.snippet {
+    let total = with_snippet.len() + without_snippet.len();
+    let all_results: Vec<_> = with_snippet.iter().chain(without_snippet.iter()).collect();
+    let display_count = if limit > 0 { limit.min(total) } else { total };
+
+    for result in &all_results[..display_count] {
+        match &result.snippet {
             Some(snippet) => {
-                println!("File: {}:{}", snippet.path.display(), snippet.line_number);
-                for (line_no, line) in snippet.lines {
-                    println!("{line_no}: {line}");
+                let path_str = snippet.path.display().to_string();
+                let display_path = clean_display_path(&path_str);
+                println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
+                for (line_no, line) in &snippet.lines {
+                    let truncated = truncate_line(line, 200);
+                    if line.contains(&query) {
+                        println!("\x1b[32m{line_no}\x1b[0m:{truncated}");
+                    } else {
+                        println!("\x1b[2m{line_no}\x1b[0m:{truncated}");
+                    }
                 }
                 println!();
             }
-            None => println!("File: {}", path.display()),
+            None => {
+                let display_path = clean_display_path(&result.path);
+                println!("{display_path}");
+            }
         }
+    }
+
+    if limit > 0 && total > limit {
+        eprintln!(
+            "... and {} more results (use --limit 0 for all)",
+            total - limit
+        );
     }
 
     Ok(())
@@ -317,43 +438,88 @@ pub async fn run_file_search_with_daemon(
     pattern: String,
     wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let command_started = Instant::now();
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
     let first_time = !db_path.exists();
+    info!(
+        root = %root.display(),
+        db = %db_path.display(),
+        pattern = %pattern,
+        wait,
+        first_time,
+        "search-file command starting"
+    );
+    let ensure_started = Instant::now();
     let was_running = daemon::ensure_daemon(&root, &db_path)?;
+    info!(
+        root = %root.display(),
+        db = %db_path.display(),
+        was_running,
+        elapsed_ms = ensure_started.elapsed().as_millis() as u64,
+        "ensure_daemon finished for search-file command"
+    );
 
     if first_time {
         eprintln!("Starting index for the first time. Results will be partial until indexing completes.");
     }
 
     if !was_running {
+        let daemon_wait_started = Instant::now();
         let confirmed = daemon::wait_for_daemon(&db_path, Duration::from_secs(3));
+        info!(
+            db = %db_path.display(),
+            confirmed,
+            elapsed_ms = daemon_wait_started.elapsed().as_millis() as u64,
+            "daemon readiness wait finished for search-file command"
+        );
         if !confirmed {
             warn!("Daemon did not confirm in 3 s, proceeding with search anyway");
         }
     }
 
     if wait {
-        if !daemon::wait_for_index_complete(&db_path, Duration::from_secs(120)) {
+        let index_wait_started = Instant::now();
+        let complete = daemon::wait_for_index_complete(&db_path, Duration::from_secs(120));
+        info!(
+            db = %db_path.display(),
+            complete,
+            elapsed_ms = index_wait_started.elapsed().as_millis() as u64,
+            "index completion wait finished for search-file command"
+        );
+        if !complete {
             eprintln!("Timed out waiting for index to complete (120 s).");
         }
     }
 
     if !db_path.exists() {
+        info!(
+            db = %db_path.display(),
+            elapsed_ms = command_started.elapsed().as_millis() as u64,
+            "search-file command finished before database directory was created"
+        );
         return Ok(());
     }
 
     let hits = match search_files_in_database(&db_path, &pattern) {
         Ok(h) => h,
         Err(err) => {
-            error!("File search failed: {:?}", err);
+            error!(db = %db_path.display(), pattern = %pattern, error = ?err, "search-file command failed");
             std::process::exit(1);
         }
     };
 
+    info!(
+        db = %db_path.display(),
+        pattern = %pattern,
+        hits = hits.len(),
+        elapsed_ms = command_started.elapsed().as_millis() as u64,
+        "search-file command completed"
+    );
+
     for hit in hits {
-        println!("{}", hit.path);
+        println!("{}", clean_display_path(&hit.path));
     }
 
     Ok(())
@@ -426,6 +592,7 @@ pub async fn run_stop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
+    info!(root = %root.display(), db = %db_path.display(), "stop command requested");
     daemon::stop_daemon(&db_path)?;
     println!("Stop requested for {}", root.display());
     Ok(())
@@ -441,7 +608,7 @@ pub async fn run_stop_all() -> Result<(), Box<dyn std::error::Error>> {
         let db = info
             .root
             .join(".source_fast")
-            .join("index.db");
+            .join("index.mdb");
         daemon::stop_daemon(&db)?;
         println!("Stop requested for {}", info.root.display());
     }
@@ -454,9 +621,18 @@ pub async fn run_status(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = root.unwrap_or_else(default_root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
+    info!(root = %root.display(), db = %db_path.display(), "status command requested");
 
     match daemon::daemon_status(&db_path)? {
         Some(info) => {
+            debug!(
+                root = %info.root.display(),
+                pid = ?info.pid,
+                version = ?info.version,
+                index_status = ?info.index_status,
+                leader_holder = ?info.leader_holder,
+                "status command loaded daemon info"
+            );
             println!("Root:         {}", info.root.display());
             println!(
                 "PID:          {}",
@@ -509,6 +685,7 @@ pub async fn run_status(
             }
         }
         None => {
+            debug!(db = %db_path.display(), "status command found no daemon info");
             println!("No daemon running for {}", root.display());
         }
     }
