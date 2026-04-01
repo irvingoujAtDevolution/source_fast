@@ -610,6 +610,12 @@ fn open_env(path: &Path) -> IndexResult<Env> {
         Ok(EnvOpenOptions::new()
             .max_dbs(MAX_DBS)
             .map_size(MAP_SIZE)
+            // WRITE_MAP: use writable mmap instead of write() syscalls,
+            // letting the OS handle page flushing.
+            // NO_META_SYNC: skip fsync of meta page on commit — only the
+            // last txn can be lost on OS crash. The index is rebuildable
+            // so this is a safe durability trade-off.
+            .flags(heed::EnvFlags::WRITE_MAP | heed::EnvFlags::NO_META_SYNC)
             .open(path)?)
     }
 }
