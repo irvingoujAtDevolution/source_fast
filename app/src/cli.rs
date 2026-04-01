@@ -184,6 +184,10 @@ impl WatchState {
                 *self.mode.lock().unwrap() = plan.mode.as_str().to_string();
                 self.current_file.lock().unwrap().clear();
             }
+            ScanEvent::PhaseChanged(label) => {
+                *self.mode.lock().unwrap() = label;
+                // Do NOT reset counters.
+            }
             ScanEvent::FileStarted(path) => {
                 *self.current_file.lock().unwrap() = path;
             }
@@ -1239,6 +1243,18 @@ pub async fn run_index_watch(
         drop(created);
     }
 
+    // If a daemon is actively building, attach to its progress instead of killing it.
+    if is_leader_active_readonly(&db_path).unwrap_or(false) {
+        let status = read_meta_readonly(&db_path, daemon::meta_keys::INDEX_STATUS)
+            .ok()
+            .flatten();
+        if status.as_deref() == Some(daemon::index_status::BUILDING) {
+            eprintln!("Daemon is building the index. Attaching to progress...");
+            watch_progress_polling(&db_path);
+            return Ok(());
+        }
+    }
+
     best_effort_stop_daemon(&db_path);
 
     let index = Arc::new(open_index_with_worktree_copy(&root, &db_path)?);
@@ -1365,6 +1381,11 @@ pub async fn run_index_watch(
     }
 
     scan_result?;
+
+    // Restart daemon for background file watching.
+    drop(index);
+    let _ = daemon::spawn_daemon(&root, &db_path);
+
     Ok(())
 }
 

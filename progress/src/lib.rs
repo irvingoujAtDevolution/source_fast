@@ -27,6 +27,9 @@ pub struct ScanPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScanEvent {
     Started(ScanPlan),
+    /// Phase transition label (e.g., "reading packfile", "writing index").
+    /// Does NOT reset counters — only updates the display label.
+    PhaseChanged(String),
     FileStarted(String),
     FileFinished { path: String, bytes: u64 },
     Finished,
@@ -67,6 +70,10 @@ impl IndexProgress {
                 self.total_bytes = Some(plan.total_bytes);
                 self.current_path = None;
                 self.last_completed_path = None;
+            }
+            ScanEvent::PhaseChanged(label) => {
+                self.mode = Some(label);
+                // Do NOT reset counters — progress is monotonic.
             }
             ScanEvent::FileStarted(path) => {
                 self.current_path = Some(path);

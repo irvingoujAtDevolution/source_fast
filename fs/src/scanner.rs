@@ -677,6 +677,7 @@ fn initial_git_scan_with_progress(
         total_files,
         total_bytes: estimated_bytes,
     }));
+    progress(ScanEvent::PhaseChanged("reading packfile".into()));
 
     // Phase 2a: Read all blobs from packfile (sequential — gix is !Sync).
     let workdir_str = workdir.display().to_string();
@@ -737,12 +738,7 @@ fn initial_git_scan_with_progress(
         read_start.elapsed()
     );
 
-    // Update progress with accurate totals now that we know them.
-    progress(ScanEvent::Started(ScanPlan {
-        mode: ScanMode::GitInitial,
-        total_files: raw_files.len(),
-        total_bytes: actual_bytes,
-    }));
+    progress(ScanEvent::PhaseChanged("extracting trigrams".into()));
 
     // Phase 2b: Parallel trigram extraction + build bitmap array.
     // Uses a fixed 16M-entry array (one per possible trigram) instead of HashMap.
@@ -805,6 +801,7 @@ fn initial_git_scan_with_progress(
     );
 
     // Phase 2c: Bulk write to LMDB in one transaction.
+    progress(ScanEvent::PhaseChanged("writing index".into()));
     let write_start = std::time::Instant::now();
     index.bulk_cold_index_direct(entries, trigram_map)?;
     info!(
@@ -812,13 +809,12 @@ fn initial_git_scan_with_progress(
         write_start.elapsed()
     );
 
-    progress(ScanEvent::Finished);
-
-    // Also pick up dirty/untracked files from the working tree
+    // Phase 2d: Pick up dirty/untracked files from the working tree
     // (packfile only has committed content)
     match collect_worktree_candidates(&repo, workdir) {
         Ok(dirty_paths) => {
             if !dirty_paths.is_empty() {
+                progress(ScanEvent::PhaseChanged("updating dirty files".into()));
                 info!(
                     "initial_git_scan: indexing {} dirty/untracked files from filesystem",
                     dirty_paths.len()
@@ -835,6 +831,9 @@ fn initial_git_scan_with_progress(
             warn!("initial_git_scan: failed to collect worktree candidates: {err}");
         }
     }
+
+    // Finished — after ALL phases including dirty files.
+    progress(ScanEvent::Finished);
 
     if let Err(err) = index.set_meta("git_head", current_head) {
         warn!("smart_scan: failed to store git_head in meta: {err}");
