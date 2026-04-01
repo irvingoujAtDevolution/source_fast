@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,13 +23,12 @@ fn collect_trigrams_bytes(bytes: &[u8]) -> Vec<[u8; 3]> {
         return Vec::new();
     }
 
-    let mut set: HashSet<[u8; 3]> = HashSet::new();
-    for window in bytes.windows(3) {
-        set.insert([window[0], window[1], window[2]]);
-    }
-
-    let mut result: Vec<[u8; 3]> = set.into_iter().collect();
+    let mut result: Vec<[u8; 3]> = bytes
+        .windows(3)
+        .map(|w| [w[0], w[1], w[2]])
+        .collect();
     result.sort_unstable();
+    result.dedup();
     result
 }
 

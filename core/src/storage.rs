@@ -586,9 +586,10 @@ pub fn is_leader_active_readonly(db_path: &Path) -> IndexResult<bool> {
 }
 
 impl FileIdState {
-    fn get_or_create_file_id(&mut self, path: &str) -> IndexResult<u32> {
+    /// Returns (file_id, is_new). `is_new` is true if this file_id was just created.
+    fn get_or_create_file_id(&mut self, path: &str) -> IndexResult<(u32, bool)> {
         if let Some(&id) = self.file_ids.get(path) {
-            return Ok(id);
+            return Ok((id, false));
         }
         let file_id = self.next_file_id;
         self.next_file_id = self
@@ -596,7 +597,7 @@ impl FileIdState {
             .checked_add(1)
             .ok_or_else(|| IndexError::Encode("file ID space exhausted (u32::MAX)".to_string()))?;
         self.file_ids.insert(path.to_string(), file_id);
-        Ok(file_id)
+        Ok((file_id, true))
     }
 
     fn remove_file_id(&mut self, path: &str) -> Option<u32> {
@@ -811,8 +812,39 @@ fn upsert_file(
     modified_ts: u64,
     trigrams: &[[u8; 3]],
 ) -> IndexResult<()> {
-    let file_id = ids.get_or_create_file_id(path)?;
+    let (file_id, is_new) = ids.get_or_create_file_id(path)?;
 
+    // ---- Fast path: brand-new file, skip all LMDB reads ----
+    if is_new {
+        let record = FileRecord {
+            path: path.to_string(),
+            last_modified: modified_ts,
+        };
+        let encoded = encode_bytes(&record)?;
+        dbs.files.put(wtxn, &file_id, &encoded)?;
+        dbs.files_by_path.put(wtxn, path, &file_id)?;
+
+        let encoded_trigrams = encode_bytes(trigrams)?;
+        dbs.file_trigrams.put(wtxn, &file_id, &encoded_trigrams)?;
+
+        // All trigrams are new — insert file_id into each bitmap.
+        // Read existing bitmap (may exist from other files) and add.
+        for trigram in trigrams {
+            let mut bitmap = dbs
+                .trigrams
+                .get(wtxn, &trigram[..])?
+                .map(decode_bytes::<RoaringBitmap>)
+                .transpose()?
+                .unwrap_or_default();
+            bitmap.insert(file_id);
+            let encoded = encode_bytes(&bitmap)?;
+            dbs.trigrams.put(wtxn, &trigram[..], &encoded)?;
+        }
+
+        return Ok(());
+    }
+
+    // ---- Slow path: existing file, need to diff trigrams ----
     let existing_record = dbs
         .files
         .get(wtxn, &file_id)?
