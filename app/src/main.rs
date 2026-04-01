@@ -184,15 +184,29 @@ enum Command {
     long_about = None
 )]
 struct Args {
+    /// Print the LLM skill description for sf (for AI agent integration)
+    #[arg(long)]
+    skill: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    match args.command {
+    if args.skill {
+        print!("{}", include_str!("skill.md"));
+        return Ok(());
+    }
+
+    let Some(command) = args.command else {
+        Args::parse_from(["sf", "--help"]);
+        return Ok(());
+    };
+
+    match command {
         Command::Search {
             root,
             db,
