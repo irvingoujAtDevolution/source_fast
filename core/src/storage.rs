@@ -227,6 +227,14 @@ impl PersistentIndex {
         self.flush()?;
         self.set_write_enabled(false);
 
+        // Extend lease TTL to cover the long bulk write (8-10s+).
+        // Normal TTL is 5s which would expire mid-transaction.
+        // This must happen BEFORE env.write_txn() to avoid deadlock
+        // (renew_writer_lease also needs a write txn).
+        if let Ok(Some((holder, _))) = self.read_leader_info() {
+            let _ = self.renew_writer_lease(&holder, Duration::from_secs(120));
+        }
+
         let result = (|| -> IndexResult<()> {
             let mut wtxn = self.env.write_txn()?;
 

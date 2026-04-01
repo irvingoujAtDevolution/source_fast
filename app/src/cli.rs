@@ -52,6 +52,37 @@ fn truncate_line(line: &str, max_chars: usize) -> String {
     }
 }
 
+/// Get terminal width from $COLUMNS env var, fallback to 120.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120)
+}
+
+/// Truncate a string with ANSI escape codes to fit within `max_width` display columns.
+fn truncate_to_display_width(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            out.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            out.push(ch);
+        } else if width < max_width {
+            out.push(ch);
+            width += 1;
+        }
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 /// Build a combined file-filter regex from --file-regex, --ext, and --glob.
 fn build_file_filter(
     file_regex: &Option<String>,
@@ -372,7 +403,6 @@ fn watch_progress_polling(db_path: &Path) {
     use source_fast_core::storage::open_readonly_env;
 
     let poll_interval = Duration::from_millis(50);
-    let mut last_line_len = 0usize;
 
     // Open the LMDB env once and reuse it for all polls.
     // This avoids re-mapping 1 GB of virtual memory and re-acquiring the
@@ -417,13 +447,9 @@ fn watch_progress_polling(db_path: &Path) {
             None => "No index is being built.".to_string(),
         };
 
-        let padding = if line.len() < last_line_len {
-            " ".repeat(last_line_len - line.len())
-        } else {
-            String::new()
-        };
-        eprint!("\r{line}{padding}");
-        last_line_len = line.len();
+        let term_width = terminal_width();
+        let truncated = truncate_to_display_width(&line, term_width);
+        eprint!("\r\x1b[2K{truncated}");
 
         if status == "complete" || status == "failed" {
             eprintln!();
