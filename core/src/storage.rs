@@ -14,7 +14,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use regex::Regex;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::error::{IndexError, IndexResult};
 use crate::model::{SearchHit, SearchResult};
@@ -84,6 +84,14 @@ enum IndexPayload {
         value: String,
     },
     Flush,
+    ReloadIds,
+}
+
+/// Entry for bulk cold indexing — pre-extracted file data.
+pub struct BulkFileEntry {
+    pub path: String,
+    pub modified_ts: u64,
+    pub trigrams: Vec<[u8; 3]>,
 }
 
 impl IndexPayload {
@@ -94,7 +102,7 @@ impl IndexPayload {
             }
             IndexPayload::RemoveFile { path } => path.len() + 64,
             IndexPayload::SetMeta { key, value } => key.len() + value.len(),
-            IndexPayload::Flush => 0,
+            IndexPayload::Flush | IndexPayload::ReloadIds => 0,
         }
     }
 }
@@ -183,6 +191,105 @@ impl PersistentIndex {
             .send(job)
             .map_err(|_| IndexError::Encode("writer thread has shut down".to_string()))?;
         Ok(())
+    }
+
+    /// Index pre-read content for a given path. Skips filesystem I/O.
+    /// Used by the packfile-based scanner which reads blobs from git objects.
+    pub fn index_content(&self, path: &str, content: &str, modified_ts: u64) -> IndexResult<()> {
+        if !self.write_enabled() {
+            return Ok(());
+        }
+        let trigrams = collect_trigrams(content);
+        let (resp_tx, _resp_rx) = mpsc::channel();
+        let job = IndexJob {
+            payload: IndexPayload::UpsertFile {
+                path: path.to_string(),
+                modified_ts,
+                trigrams,
+            },
+            resp: resp_tx,
+        };
+        self.sender()?
+            .send(job)
+            .map_err(|_| IndexError::Encode("writer thread has shut down".to_string()))?;
+        Ok(())
+    }
+
+    /// Bulk-load files into the index in a single LMDB transaction.
+    /// Bypasses the writer thread entirely. Call on cold builds only.
+    /// The caller must provide pre-built trigram bitmaps.
+    pub fn bulk_cold_index_direct(
+        &self,
+        entries: Vec<BulkFileEntry>,
+        trigram_map: HashMap<[u8; 3], RoaringBitmap>,
+    ) -> IndexResult<()> {
+        // Drain the writer thread queue and pause it.
+        self.flush()?;
+        self.set_write_enabled(false);
+
+        let result = (|| -> IndexResult<()> {
+            let mut wtxn = self.env.write_txn()?;
+
+            // Write files + files_by_path + file_trigrams
+            for (file_id, entry) in entries.iter().enumerate() {
+                let fid = file_id as u32;
+                let record = FileRecord {
+                    path: entry.path.clone(),
+                    last_modified: entry.modified_ts,
+                };
+                let encoded = encode_bytes(&record)?;
+                self.dbs.files.put(&mut wtxn, &fid, &encoded)?;
+                self.dbs
+                    .files_by_path
+                    .put(&mut wtxn, entry.path.as_str(), &fid)?;
+
+                if !entry.trigrams.is_empty() {
+                    let encoded_tri = encode_bytes(&entry.trigrams)?;
+                    self.dbs
+                        .file_trigrams
+                        .put(&mut wtxn, &fid, &encoded_tri)?;
+                }
+            }
+
+            // Write trigrams in sorted key order for optimal B-tree insertion.
+            let mut sorted_trigrams: Vec<[u8; 3]> = trigram_map.keys().copied().collect();
+            sorted_trigrams.sort_unstable();
+
+            for trigram in &sorted_trigrams {
+                if let Some(bitmap) = trigram_map.get(trigram) {
+                    let encoded = encode_bytes(bitmap)?;
+                    self.dbs
+                        .trigrams
+                        .put(&mut wtxn, &trigram[..], &encoded)?;
+                }
+            }
+
+            wtxn.commit()?;
+            info!(
+                files = entries.len(),
+                trigrams = sorted_trigrams.len(),
+                "bulk_cold_index_direct: committed"
+            );
+            Ok(())
+        })();
+
+        // Resume writer thread regardless of success/failure.
+        self.set_write_enabled(true);
+
+        // Tell writer thread to reload its FileIdState.
+        if result.is_ok() {
+            let (resp_tx, resp_rx) = mpsc::channel();
+            let job = IndexJob {
+                payload: IndexPayload::ReloadIds,
+                resp: resp_tx,
+            };
+            if let Ok(sender) = self.sender() {
+                let _ = sender.send(job);
+                let _ = resp_rx.recv();
+            }
+        }
+
+        result
     }
 
     pub fn remove_path(&self, path: &Path) -> IndexResult<()> {
@@ -779,6 +886,9 @@ fn process_batch(storage: &mut LmdbStorage, batch: Vec<IndexJob>, write_enabled:
             Flush => {
                 flushes += 1;
             }
+            ReloadIds => {
+                // Handled after commit — reload file ID state from DB.
+            }
         }
     }
 
@@ -798,6 +908,19 @@ fn process_batch(storage: &mut LmdbStorage, batch: Vec<IndexJob>, write_enabled:
     }
 
     debug!("process_batch commit succeeded");
+
+    // Check if any job requested a FileIdState reload (after bulk_cold_index_direct).
+    let needs_reload = batch.iter().any(|j| matches!(j.payload, ReloadIds));
+    if needs_reload {
+        match load_file_id_state(&storage.env, &storage.dbs) {
+            Ok(ids) => {
+                storage.ids = ids;
+                debug!("ReloadIds: file ID state reloaded");
+            }
+            Err(err) => error!(error = %err, "ReloadIds: failed to reload file ID state"),
+        }
+    }
+
     for job in batch {
         let _ = job.resp.send(Ok(()));
     }

@@ -616,7 +616,7 @@ fn initial_git_scan_with_progress(
     progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
 ) -> Result<(), IndexError> {
     info!(
-        "initial_git_scan: starting gix-based scan at {}",
+        "initial_git_scan: starting packfile-based scan at {}",
         workdir.display()
     );
 
@@ -634,57 +634,182 @@ fn initial_git_scan_with_progress(
         }
     };
 
-    let mut candidates: HashSet<PathBuf> = HashSet::new();
-
-    // 1. Tracked files: equivalent to `git ls-files` using gix index
-    match collect_index_candidates(&repo, workdir) {
-        Ok(index_paths) => {
-            let tracked_count = index_paths.len();
-            candidates.extend(index_paths);
-            info!(
-                "initial_git_scan: found {} tracked files from index",
-                tracked_count
-            );
-        }
+    // Phase 1: Walk the HEAD tree and collect all blob entries from packfile
+    let head = match repo.head_commit() {
+        Ok(h) => h,
         Err(err) => {
-            warn!("initial_git_scan: failed to read git index: {err} – falling back to full walk");
+            warn!("initial_git_scan: failed to get HEAD commit: {err} – falling back to full walk");
             initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
-            } else {
-                info!("smart_scan: stored git_head={} in meta", current_head);
             }
             return Ok(());
         }
-    }
+    };
 
-    // 2. Dirty / untracked state using gix status
-    match collect_worktree_candidates(&repo, workdir) {
-        Ok(dirty_paths) => {
-            let dirty_count = dirty_paths.len();
-            candidates.extend(dirty_paths);
-            if dirty_count > 0 {
-                info!(
-                    "initial_git_scan: found {} dirty/untracked files",
-                    dirty_count
-                );
-            }
-        }
+    let root_tree_id = match head.tree_id() {
+        Ok(id) => id,
         Err(err) => {
-            warn!(
-                "initial_git_scan: failed to collect worktree candidates: {err} – continuing without dirty-state candidates"
+            warn!("initial_git_scan: failed to get tree id: {err} – falling back to full walk");
+            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
+            if let Err(err) = index.set_meta("git_head", current_head) {
+                warn!("smart_scan: failed to store git_head in meta: {err}");
+            }
+            return Ok(());
+        }
+    };
+
+    let mut blob_entries: Vec<(String, gix::ObjectId)> = Vec::new();
+    collect_tree_blobs(&repo, root_tree_id.into(), "", &mut blob_entries);
+
+    // Count total bytes for progress (estimate from blob count)
+    let total_files = blob_entries.len();
+    info!(
+        "initial_git_scan: found {} blobs in HEAD tree via packfile",
+        total_files
+    );
+
+    // We don't know total_bytes upfront without reading all blobs.
+    // Use a rough estimate (15 KB avg per file).
+    let estimated_bytes = total_files as u64 * 15 * 1024;
+    progress(ScanEvent::Started(ScanPlan {
+        mode: ScanMode::GitInitial,
+        total_files,
+        total_bytes: estimated_bytes,
+    }));
+
+    // Phase 2a: Read all blobs from packfile (sequential — gix is !Sync).
+    let workdir_str = workdir.display().to_string();
+    let sep = std::path::MAIN_SEPARATOR;
+
+    info!("initial_git_scan: reading blobs from packfile...");
+    let read_start = std::time::Instant::now();
+
+    let mut raw_files: Vec<(String, String)> = Vec::with_capacity(total_files);
+    let mut actual_bytes: u64 = 0;
+    let mut read_count = 0usize;
+
+    for (rel_path, oid) in &blob_entries {
+        let Ok(obj) = repo.find_object(*oid) else {
+            continue;
+        };
+        let data: &[u8] = obj.data.as_ref();
+
+        let sniff_len = data.len().min(8192);
+        if data[..sniff_len].contains(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(data) else {
+            continue;
+        };
+        if text.len() < 3 {
+            continue;
+        }
+
+        let abs_path = format!(
+            "{workdir_str}{sep}{}",
+            rel_path.replace('/', &sep.to_string())
+        );
+
+        progress(ScanEvent::FileStarted(abs_path.clone()));
+
+        actual_bytes += data.len() as u64;
+        raw_files.push((abs_path.clone(), text.to_string()));
+        read_count += 1;
+
+        progress(ScanEvent::FileFinished {
+            path: abs_path,
+            bytes: data.len() as u64,
+        });
+
+        if read_count % 2000 == 0 {
+            info!(
+                "initial_git_scan: read {read_count}/{total_files} files ({} MB) from packfile",
+                actual_bytes / (1024 * 1024)
             );
         }
     }
 
-    let (candidate_files, candidate_bytes) = count_candidates(root, candidates.clone());
+    info!(
+        "initial_git_scan: read {} text files ({} MB) from packfile in {:?}",
+        raw_files.len(),
+        actual_bytes / (1024 * 1024),
+        read_start.elapsed()
+    );
+
+    // Update progress with accurate totals now that we know them.
     progress(ScanEvent::Started(ScanPlan {
         mode: ScanMode::GitInitial,
-        total_files: candidate_files,
-        total_bytes: candidate_bytes,
+        total_files: raw_files.len(),
+        total_bytes: actual_bytes,
     }));
-    apply_changes_by_files_with_progress(root, &index, candidates, Arc::clone(&progress))?;
+
+    // Phase 2b: Parallel trigram extraction + build bitmap map.
+    let extract_start = std::time::Instant::now();
+
+    let trigrams_per_file: Vec<(String, Vec<[u8; 3]>)> = raw_files
+        .par_iter()
+        .map(|(path, text)| {
+            (path.clone(), source_fast_core::text::collect_trigrams(text))
+        })
+        .collect();
+
+    // Build HashMap<trigram, RoaringBitmap> + Vec<BulkFileEntry>
+    let mut trigram_map: std::collections::HashMap<[u8; 3], roaring::RoaringBitmap> =
+        std::collections::HashMap::new();
+    let mut entries: Vec<source_fast_core::BulkFileEntry> =
+        Vec::with_capacity(trigrams_per_file.len());
+
+    for (file_id, (path, trigrams)) in trigrams_per_file.into_iter().enumerate() {
+        let fid = file_id as u32;
+        for tri in &trigrams {
+            trigram_map.entry(*tri).or_default().insert(fid);
+        }
+        entries.push(source_fast_core::BulkFileEntry {
+            path,
+            modified_ts: 1, // packfile blobs have no mtime; overridden on incremental
+            trigrams,
+        });
+    }
+
+    info!(
+        "initial_git_scan: extracted trigrams for {} files, {} unique trigrams in {:?}",
+        entries.len(),
+        trigram_map.len(),
+        extract_start.elapsed()
+    );
+
+    // Phase 2c: Bulk write to LMDB in one transaction.
+    let write_start = std::time::Instant::now();
+    index.bulk_cold_index_direct(entries, trigram_map)?;
+    info!(
+        "initial_git_scan: bulk LMDB write completed in {:?}",
+        write_start.elapsed()
+    );
+
     progress(ScanEvent::Finished);
+
+    // Also pick up dirty/untracked files from the working tree
+    // (packfile only has committed content)
+    match collect_worktree_candidates(&repo, workdir) {
+        Ok(dirty_paths) => {
+            if !dirty_paths.is_empty() {
+                info!(
+                    "initial_git_scan: indexing {} dirty/untracked files from filesystem",
+                    dirty_paths.len()
+                );
+                apply_changes_by_files_with_progress(
+                    root,
+                    &index,
+                    dirty_paths,
+                    Arc::clone(&progress),
+                )?;
+            }
+        }
+        Err(err) => {
+            warn!("initial_git_scan: failed to collect worktree candidates: {err}");
+        }
+    }
 
     if let Err(err) = index.set_meta("git_head", current_head) {
         warn!("smart_scan: failed to store git_head in meta: {err}");
@@ -693,6 +818,37 @@ fn initial_git_scan_with_progress(
     }
 
     Ok(())
+}
+
+/// Recursively collect all blob entries from a git tree.
+fn collect_tree_blobs(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    prefix: &str,
+    out: &mut Vec<(String, gix::ObjectId)>,
+) {
+    let Ok(obj) = repo.find_object(tree_id) else {
+        return;
+    };
+    let Ok(tree) = obj.try_into_tree() else {
+        return;
+    };
+    let Ok(tree_ref) = tree.decode() else {
+        return;
+    };
+    for entry in tree_ref.entries.iter() {
+        let name = entry.filename.to_str_lossy();
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.mode.is_tree() {
+            collect_tree_blobs(repo, entry.oid.into(), &path, out);
+        } else if entry.mode.is_blob() {
+            out.push((path, entry.oid.into()));
+        }
+    }
 }
 
 fn apply_changes_by_files_with_progress(
