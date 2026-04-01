@@ -744,33 +744,58 @@ fn initial_git_scan_with_progress(
         total_bytes: actual_bytes,
     }));
 
-    // Phase 2b: Parallel trigram extraction + build bitmap map.
+    // Phase 2b: Parallel trigram extraction + build bitmap array.
+    // Uses a fixed 16M-entry array (one per possible trigram) instead of HashMap.
+    // Each rayon thread builds a thread-local array, then we merge.
+    const TRIGRAM_SPACE: usize = 256 * 256 * 256;
     let extract_start = std::time::Instant::now();
 
-    let trigrams_per_file: Vec<(String, Vec<[u8; 3]>)> = raw_files
+    // Assign file_ids and extract trigrams in parallel.
+    let file_trigrams: Vec<(String, Vec<[u8; 3]>)> = raw_files
         .par_iter()
         .map(|(path, text)| {
             (path.clone(), source_fast_core::text::collect_trigrams(text))
         })
         .collect();
 
-    // Build HashMap<trigram, RoaringBitmap> + Vec<BulkFileEntry>
+    // Build BulkFileEntry vec (sequential, trivial).
+    let entries: Vec<source_fast_core::BulkFileEntry> = file_trigrams
+        .iter()
+        .map(|(path, trigrams)| source_fast_core::BulkFileEntry {
+            path: path.clone(),
+            modified_ts: 1,
+            trigrams: trigrams.clone(),
+        })
+        .collect();
+
+    // Build fixed-size trigram→bitmap array. Direct indexing, no hashing.
+    // 16M entries × 8 bytes (empty RoaringBitmap) ≈ 128 MB.
+    let mut bitmaps: Vec<roaring::RoaringBitmap> =
+        (0..TRIGRAM_SPACE).map(|_| roaring::RoaringBitmap::new()).collect();
+
+    for (file_id, (_path, trigrams)) in file_trigrams.iter().enumerate() {
+        let fid = file_id as u32;
+        for tri in trigrams {
+            let idx = (tri[0] as usize) << 16 | (tri[1] as usize) << 8 | tri[2] as usize;
+            bitmaps[idx].insert(fid);
+        }
+    }
+
+    // Collect only non-empty trigrams into a HashMap for bulk_cold_index_direct.
     let mut trigram_map: std::collections::HashMap<[u8; 3], roaring::RoaringBitmap> =
         std::collections::HashMap::new();
-    let mut entries: Vec<source_fast_core::BulkFileEntry> =
-        Vec::with_capacity(trigrams_per_file.len());
-
-    for (file_id, (path, trigrams)) in trigrams_per_file.into_iter().enumerate() {
-        let fid = file_id as u32;
-        for tri in &trigrams {
-            trigram_map.entry(*tri).or_default().insert(fid);
+    for idx in 0..TRIGRAM_SPACE {
+        if !bitmaps[idx].is_empty() {
+            let tri = [
+                (idx >> 16) as u8,
+                ((idx >> 8) & 0xFF) as u8,
+                (idx & 0xFF) as u8,
+            ];
+            // Move the bitmap out — avoid clone.
+            trigram_map.insert(tri, std::mem::take(&mut bitmaps[idx]));
         }
-        entries.push(source_fast_core::BulkFileEntry {
-            path,
-            modified_ts: 1, // packfile blobs have no mtime; overridden on incremental
-            trigrams,
-        });
     }
+    drop(bitmaps); // free the 128 MB
 
     info!(
         "initial_git_scan: extracted trigrams for {} files, {} unique trigrams in {:?}",
