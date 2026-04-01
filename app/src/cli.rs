@@ -80,7 +80,7 @@ fn build_file_filter(
 }
 
 /// Convert a simple glob pattern to a regex. Handles *, **, and ?.
-fn glob_to_regex(glob: &str) -> String {
+pub fn glob_to_regex(glob: &str) -> String {
     let mut re = String::from("(?i)");
     let mut chars = glob.chars().peekable();
     while let Some(ch) = chars.next() {

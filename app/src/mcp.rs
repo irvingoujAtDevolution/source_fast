@@ -39,9 +39,30 @@ impl SearchServer {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct SearchCodeArgs {
+    /// Substring to search for (minimum 3 characters).
     pub query: String,
+    /// Filter results by file extension (e.g. ["rs", "cs"]).
+    #[serde(default)]
+    pub ext: Vec<String>,
+    /// Filter results by glob pattern (e.g. "*.rs").
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Filter results by file path regex (advanced).
     #[serde(default)]
     pub file_regex: Option<String>,
+    /// Return only file paths without snippets.
+    #[serde(default)]
+    pub files_only: bool,
+    /// Return only the match count.
+    #[serde(default)]
+    pub count: bool,
+    /// Maximum number of results (0 = unlimited, default 50).
+    #[serde(default = "default_mcp_limit")]
+    pub limit: usize,
+}
+
+fn default_mcp_limit() -> usize {
+    50
 }
 
 #[tool_router]
@@ -55,7 +76,7 @@ impl SearchServer {
     }
 
     #[tool(
-        description = "Stateful code search over the current workspace using a persistent on-disk trigram index that is kept up-to-date with file changes. For large monorepos or huge codebases, prefer this tool over ad-hoc text search."
+        description = "Stateful code search over the current workspace using a persistent on-disk trigram index that is kept up-to-date with file changes. For large monorepos or huge codebases, prefer this tool over ad-hoc text search. Supports filtering by extension, glob, or regex. Returns snippets with context by default, or just file paths/count."
     )]
     pub async fn search_code(
         &self,
@@ -63,20 +84,18 @@ impl SearchServer {
     ) -> Result<CallToolResult, McpError> {
         let index_building = !self.index_ready.load(Ordering::SeqCst);
 
-        let query = args.query.clone();
-        let query_for_search = query.clone();
-        let index = Arc::clone(&self.index);
-        let file_regex = args
-            .file_regex
-            .as_ref()
-            .map(|pattern| {
-                Regex::new(pattern)
-                    .map_err(|e| Self::internal_error("invalid_file_regex", e.to_string()))
-            })
-            .transpose()?;
+        // Build file filter from ext, glob, or file_regex.
+        let file_regex = build_mcp_file_filter(&args.file_regex, &args.ext, &args.glob)
+            .map_err(|e| Self::internal_error("invalid_filter", e.to_string()))?;
 
-        let results = task::spawn_blocking(move || {
-            index.search_with_snippets_filtered(&query_for_search, file_regex.as_ref())
+        let query = args.query.clone();
+        let index = Arc::clone(&self.index);
+        let files_only = args.files_only;
+        let count = args.count;
+        let limit = if args.limit == 0 { usize::MAX } else { args.limit };
+
+        let hits = task::spawn_blocking(move || {
+            index.search_filtered(&query, file_regex.as_ref())
         })
         .await
         .map_err(|e| Self::internal_error("search_task_failed", e.to_string()))?
@@ -85,32 +104,51 @@ impl SearchServer {
         let mut contents = Vec::new();
         if index_building {
             contents.push(Content::text(
-                "Warning (source_fast): index is still building.\n- Returned results come from the existing on-disk index and may be stale/incomplete vs the current working tree.\n- New/modified/deleted files since the index build started might be missing or still present.\n- Retry the same search in a few seconds for up-to-date results.\n"
+                "Warning: index is still building. Results may be incomplete. Retry in a few seconds.\n"
                     .to_string(),
             ));
         }
 
-        for result in results {
-            let path = PathBuf::from(&result.path);
+        // --count mode
+        if count {
+            contents.push(Content::text(format!("{}", hits.len())));
+            return Ok(CallToolResult::success(contents));
+        }
 
-            if let Some(err) = result.snippet_error.as_ref() {
-                warn!(path = %path.display(), error = %err, "Failed to extract snippet");
+        // --files-only mode
+        if files_only {
+            for (i, hit) in hits.iter().enumerate() {
+                if i >= limit { break; }
+                contents.push(Content::text(format!("{}\n", clean_path(&hit.path))));
             }
+            if hits.len() > limit {
+                contents.push(Content::text(format!("... and {} more results\n", hits.len() - limit)));
+            }
+            return Ok(CallToolResult::success(contents));
+        }
 
-            match result.snippet {
-                Some(snippet) => {
-                    let mut text =
-                        format!("File: {}:{}\n", snippet.path.display(), snippet.line_number);
-                    for (line_no, line) in snippet.lines {
+        // Default: snippets with context
+        let query_for_snippets = args.query.clone();
+        for (i, hit) in hits.iter().enumerate() {
+            if i >= limit { break; }
+            let path = PathBuf::from(&hit.path);
+            let display = clean_path(&hit.path);
+            match source_fast_core::extract_snippet(&path, &query_for_snippets) {
+                Ok(Some(snippet)) => {
+                    let mut text = format!("{}:{}\n", display, snippet.line_number);
+                    for (line_no, line) in &snippet.lines {
                         text.push_str(&format!("{line_no}: {line}\n"));
                     }
                     contents.push(Content::text(text));
                 }
-                None => {
-                    let text = format!("File: {}\n", path.display());
-                    contents.push(Content::text(text));
+                _ => {
+                    contents.push(Content::text(format!("{display}\n")));
                 }
             }
+        }
+
+        if hits.len() > limit {
+            contents.push(Content::text(format!("... and {} more results\n", hits.len() - limit)));
         }
 
         Ok(CallToolResult::success(contents))
@@ -130,6 +168,32 @@ impl ServerHandler for SearchServer {
             server_info: Implementation::from_build_env(),
         }
     }
+}
+
+/// Strip the `\\?\` extended path prefix on Windows.
+fn clean_path(path: &str) -> &str {
+    path.strip_prefix(r"\\?\").unwrap_or(path)
+}
+
+/// Build a file-filter regex from MCP args (same logic as CLI).
+fn build_mcp_file_filter(
+    file_regex: &Option<String>,
+    ext: &[String],
+    glob: &Option<String>,
+) -> Result<Option<Regex>, String> {
+    if let Some(pattern) = file_regex {
+        return Regex::new(pattern).map(Some).map_err(|e| e.to_string());
+    }
+    if !ext.is_empty() {
+        let alts: Vec<String> = ext.iter().map(|e| regex::escape(e)).collect();
+        let pattern = format!(r"\.({})$", alts.join("|"));
+        return Regex::new(&pattern).map(Some).map_err(|e| e.to_string());
+    }
+    if let Some(g) = glob {
+        let re_str = crate::cli::glob_to_regex(g);
+        return Regex::new(&re_str).map(Some).map_err(|e| e.to_string());
+    }
+    Ok(None)
 }
 
 pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
