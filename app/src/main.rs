@@ -72,22 +72,37 @@ enum IndexCommand {
 enum Command {
     /// Search code content. Auto-starts a background daemon if not running.
     Search {
-        /// Root directory to search
+        /// Root directory to search [default: git root or cwd]
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Path to database file
-        #[arg(long)]
+        /// Path to database file (internal, rarely needed)
+        #[arg(long, hide = true)]
         db: Option<PathBuf>,
-        /// Optional regex to filter result file paths
+        /// Filter by file extension (e.g. -e rs -e cs)
+        #[arg(short = 'e', long = "ext")]
+        ext: Vec<String>,
+        /// Filter files by glob pattern (e.g. -g '*.rs')
+        #[arg(short, long)]
+        glob: Option<String>,
+        /// Filter files by regex (advanced)
         #[arg(long = "file-regex")]
         file_regex: Option<String>,
         /// Block until the index is fully built before returning results
-        #[arg(long)]
+        #[arg(short, long)]
         wait: bool,
         /// Maximum number of results to display (0 for unlimited)
-        #[arg(long, default_value = "20")]
+        #[arg(short, long, default_value = "20")]
         limit: usize,
-        /// Search query
+        /// Output as JSON (for scripts and AI agents)
+        #[arg(short, long)]
+        json: bool,
+        /// Print only file paths, no snippets (like rg -l)
+        #[arg(long)]
+        files_only: bool,
+        /// Print only the match count
+        #[arg(short, long)]
+        count: bool,
+        /// Search query (minimum 3 characters)
         query: String,
     },
     /// Search files by path. Auto-starts a background daemon if not running.
@@ -181,13 +196,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Search {
             root,
             db,
+            ext,
+            glob,
             file_regex,
             wait,
             limit,
+            json,
+            files_only,
+            count,
             query,
         } => {
             init_tracing_cli();
-            run_search_with_daemon(root, db, query, file_regex, wait, limit).await?;
+            let opts = cli::SearchOpts {
+                root,
+                db,
+                query,
+                ext,
+                glob,
+                file_regex,
+                wait,
+                limit,
+                json,
+                files_only,
+                count,
+            };
+            run_search_with_daemon(opts).await?;
         }
         Command::SearchFile {
             root,

@@ -52,6 +52,58 @@ fn truncate_line(line: &str, max_chars: usize) -> String {
     }
 }
 
+/// Build a combined file-filter regex from --file-regex, --ext, and --glob.
+fn build_file_filter(
+    file_regex: &Option<String>,
+    ext: &[String],
+    glob: &Option<String>,
+) -> Result<Option<Regex>, Box<dyn std::error::Error>> {
+    // Explicit --file-regex takes priority.
+    if let Some(pattern) = file_regex {
+        return Ok(Some(Regex::new(pattern)?));
+    }
+
+    // --ext cs → match files ending in .cs (case-insensitive)
+    if !ext.is_empty() {
+        let alts: Vec<String> = ext.iter().map(|e| regex::escape(e)).collect();
+        let pattern = format!(r"\.({})$", alts.join("|"));
+        return Ok(Some(Regex::new(&pattern)?));
+    }
+
+    // --glob '*.rs' → convert simple glob to regex
+    if let Some(g) = glob {
+        let re_str = glob_to_regex(g);
+        return Ok(Some(Regex::new(&re_str)?));
+    }
+
+    Ok(None)
+}
+
+/// Convert a simple glob pattern to a regex. Handles *, **, and ?.
+fn glob_to_regex(glob: &str) -> String {
+    let mut re = String::from("(?i)");
+    let mut chars = glob.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next(); // consume second *
+                    re.push_str(".*");
+                } else {
+                    re.push_str("[^/\\\\]*");
+                }
+            }
+            '?' => re.push('.'),
+            '.' | '+' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '$' | '|' | '\\' => {
+                re.push('\\');
+                re.push(ch);
+            }
+            _ => re.push(ch),
+        }
+    }
+    re
+}
+
 struct WatchState {
     processed_files: AtomicUsize,
     total_files: AtomicUsize,
@@ -588,29 +640,31 @@ pub fn init_tracing_server() {
 // Search commands (daemon-aware)
 // ---------------------------------------------------------------------------
 
+pub struct SearchOpts {
+    pub root: Option<PathBuf>,
+    pub db: Option<PathBuf>,
+    pub query: String,
+    pub ext: Vec<String>,
+    pub glob: Option<String>,
+    pub file_regex: Option<String>,
+    pub wait: bool,
+    pub limit: usize,
+    pub json: bool,
+    pub files_only: bool,
+    pub count: bool,
+}
+
 pub async fn run_search_with_daemon(
-    root: Option<PathBuf>,
-    db: Option<PathBuf>,
-    query: String,
-    file_regex: Option<String>,
-    wait: bool,
-    limit: usize,
+    opts: SearchOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let command_started = Instant::now();
-    let root = root.unwrap_or_else(default_root);
-    let db_path = db.unwrap_or_else(|| default_db_path(&root));
+    let root = opts.root.unwrap_or_else(default_root);
+    let db_path = opts.db.unwrap_or_else(|| default_db_path(&root));
+    let query = opts.query;
+    let limit = opts.limit;
 
-    let file_regex = if let Some(pattern) = file_regex {
-        match Regex::new(&pattern) {
-            Ok(re) => Some(re),
-            Err(err) => {
-                error!("Invalid file regex '{}': {}", pattern, err);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
+    // Build the file filter regex from --file-regex, --ext, or --glob.
+    let file_regex = build_file_filter(&opts.file_regex, &opts.ext, &opts.glob)?;
 
     let first_time = !db_path.exists();
     info!(
@@ -618,7 +672,7 @@ pub async fn run_search_with_daemon(
         db = %db_path.display(),
         query = %query,
         file_regex = ?file_regex.as_ref().map(|re| re.as_str()),
-        wait,
+        wait = opts.wait,
         first_time,
         "search command starting"
     );
@@ -655,7 +709,7 @@ pub async fn run_search_with_daemon(
     }
 
     // If --wait, block until index is complete.
-    if wait {
+    if opts.wait {
         let index_wait_started = Instant::now();
         let complete = daemon::wait_for_index_complete(&db_path, Duration::from_secs(120));
         info!(
@@ -700,9 +754,32 @@ pub async fn run_search_with_daemon(
     let total = hits.len();
     let display_limit = if limit > 0 { limit } else { total };
 
-    // Stream results using a channel: rayon workers extract snippets in parallel
-    // and send results through a channel. The main thread prints as they arrive.
-    // Workers check `done` flag to stop early when the display limit is reached.
+    // ---- --count mode: just print the number ----
+    if opts.count {
+        println!("{total}");
+        return Ok(());
+    }
+
+    // ---- --files-only mode: print paths, no snippets ----
+    if opts.files_only {
+        for (i, hit) in hits.iter().enumerate() {
+            if i >= display_limit {
+                break;
+            }
+            println!("{}", clean_display_path(&hit.path));
+        }
+        if total > display_limit {
+            eprintln!("... and {} more (use -l 0 for all)", total - display_limit);
+        }
+        return Ok(());
+    }
+
+    // ---- --json mode: structured output ----
+    if opts.json {
+        return print_json_results(&hits, &query, display_limit);
+    }
+
+    // ---- Default: streaming rg-style output with snippets ----
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<source_fast_core::Snippet>)>(32);
 
@@ -716,7 +793,6 @@ pub async fn run_search_with_daemon(
             }
             let path = PathBuf::from(&hit.path);
             let snippet = extract_snippet(&path, &query_for_workers).ok().flatten();
-            // Send error means receiver dropped (limit reached) — stop.
             if tx.send((hit.path.clone(), snippet)).is_err() {
                 done_for_workers.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -747,16 +823,13 @@ pub async fn run_search_with_daemon(
                 no_snippet_paths.push(path);
             }
         }
-        // Stop once we have enough snippet + no-snippet results to fill the limit.
         if printed + no_snippet_paths.len() >= display_limit {
             break;
         }
     }
-    // Signal workers to stop and drop the receiver so send() fails fast.
     done.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(rx);
 
-    // Print remaining no-snippet results at the end (up to the limit).
     for path in &no_snippet_paths {
         if printed >= display_limit {
             break;
@@ -766,12 +839,49 @@ pub async fn run_search_with_daemon(
     }
 
     if total > display_limit {
-        eprintln!(
-            "... and {} more results (use --limit 0 for all)",
-            total - display_limit
-        );
+        eprintln!("... and {} more (use -l 0 for all)", total - display_limit);
     }
 
+    Ok(())
+}
+
+fn print_json_results(
+    hits: &[source_fast_core::SearchHit],
+    query: &str,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::{Value, json};
+
+    let mut results = Vec::new();
+    for (i, hit) in hits.iter().enumerate() {
+        if i >= limit {
+            break;
+        }
+        let path = PathBuf::from(&hit.path);
+        let display_path = clean_display_path(&hit.path).to_string();
+        let snippet = extract_snippet(&path, query).ok().flatten();
+        let mut entry = json!({
+            "path": display_path,
+            "file_id": hit.file_id,
+        });
+        if let Some(snippet) = snippet {
+            entry["line"] = Value::from(snippet.line_number);
+            entry["snippet"] = Value::from(
+                snippet
+                    .lines
+                    .iter()
+                    .map(|(n, l)| json!({"line": n, "text": l}))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        results.push(entry);
+    }
+    let output = json!({
+        "query": query,
+        "total": hits.len(),
+        "results": results,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
