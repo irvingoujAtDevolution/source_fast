@@ -241,9 +241,8 @@ fn best_effort_stop_daemon(db_path: &Path) {
 }
 
 fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String) {
-    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-    let progress = watch_snapshot_to_progress(snapshot);
     let bar = match snapshot.total_files {
         Some(total) if total > 0 => {
             let ratio = (snapshot.processed_files as f64 / total as f64).min(1.0);
@@ -279,9 +278,24 @@ fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String)
     } else if snapshot.phase == "failed" {
         "ETA failed".to_string()
     } else {
-        estimate_eta_seconds(&progress)
-            .map(|secs| format!("ETA {}", format_eta(secs)))
-            .unwrap_or_else(|| "ETA --".to_string())
+        // Use file-based throughput for ETA (more stable than byte-based
+        // since large files cause byte throughput to spike unpredictably).
+        let eta = snapshot.started_at_ms.and_then(|started_at_ms| {
+            let elapsed_ms = now_ms().saturating_sub(started_at_ms);
+            let total = snapshot.total_files?;
+            let done = snapshot.processed_files;
+            // Wait for at least 3 seconds and 10 files before estimating.
+            if elapsed_ms < 3000 || done < 10 || done >= total {
+                return None;
+            }
+            let remaining = total.saturating_sub(done) as u64;
+            let ms_per_file = elapsed_ms / done as u64;
+            Some((remaining * ms_per_file / 1000).max(1))
+        });
+        match eta {
+            Some(secs) => format!("ETA {}", format_eta(secs)),
+            None => "ETA --".to_string(),
+        }
     };
 
     let throughput = snapshot
@@ -296,7 +310,7 @@ fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String)
     let spinner = if snapshot.phase == "building" {
         SPINNER[(tick / 6) % SPINNER.len()]
     } else {
-        ' '
+        " "
     };
 
     let headline = format!(
