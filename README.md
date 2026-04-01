@@ -1,129 +1,80 @@
 # source_fast
 
-Fast, persistent trigram-based source search with a daemonized CLI and MCP server.
+Fast, persistent trigram-based code search with a daemonized CLI and MCP server.
 
-`source_fast` keeps a persistent on-disk index of a repository and uses it for fast substring search over code. The current implementation uses Heed/LMDB for storage, `gix` for git-aware incremental scans, `notify` for background file watching, and `rmcp` for MCP integration.
+`source_fast` keeps a persistent on-disk index of a repository and uses it for instant substring search over code. Uses LMDB (via heed) for storage, `gix` for git-aware incremental scans, `notify` for background file watching, and `rmcp` for MCP integration.
 
-## Current Capabilities
-
-- Fast substring search over indexed source files
-- Persistent LMDB-backed index stored in the repo under `.source_fast/`
-- Auto-started background daemon for warm search and continuous updates
-- Git-aware incremental scans plus full-scan fallback
-- Live index status, progress, and ETA reporting
-- Path search for file discovery
-- MCP server over stdio with a stateful `search_code` tool
-- Worktree-aware index bootstrapping from the primary worktree when possible
-
-## Workspace Layout
-
-This repository is a Cargo workspace with four crates:
-
-- `app`: `sf` CLI binary, daemon management, and MCP server
-- `core`: persistent index, trigram search, snippets, and LMDB storage
-- `fs`: filesystem scanning, git diff logic, and file watcher integration
-- `progress`: shared scan progress/status types
-
-There are also benchmark scripts and design notes at the workspace root, including the `REDB_*` and performance planning documents.
-
-## Installation
-
-Install the CLI from the workspace:
+## Quick Start
 
 ```bash
+# Install
 cargo install --path app
-```
 
-Or build locally during development:
-
-```bash
-cargo build -p source_fast
-```
-
-The binary is `sf`.
-
-## Index Storage
-
-By default, the index lives under the repository root:
-
-```text
-.source_fast/
-  index.mdb/
-  daemon.log
-```
-
-`index.mdb` is an LMDB environment directory, not a single file. You can override the location with `--db`.
-
-## CLI Overview
-
-### Search code
-
-`sf search` is the main entry point. If no daemon is running for the repo, it starts one automatically.
-
-```bash
-# Search current repository
+# Search (auto-starts daemon + indexing on first use)
 sf search "function_name"
 
-# Wait for the initial index to finish before searching
-sf search --wait "async fn"
-
-# Filter results by file path regex
-sf search --file-regex "\.rs$" "PersistentIndex"
-
-# Show all results
-sf search --limit 0 "leader lease"
+# Pre-build index with live progress
+sf index watch
 ```
 
-Notes:
+## Search
 
-- Content search is substring-based, not full regex search
-- Queries shorter than 3 characters return no results
-- Initial searches may be partial while the first index build is still running
+```bash
+sf search "query"                       # rg-style output with snippets
+sf search -e rs "query"                 # filter by extension (.rs files only)
+sf search -e cs -e xaml "ViewModel"     # multiple extensions
+sf search -g '*.test.ts' "describe"     # filter by glob pattern
+sf search --file-regex '\.rs$' "query"  # filter by regex (advanced)
+sf search -l 50 "query"                 # show 50 results (default: 20, 0=all)
+sf search -w "query"                    # wait for index to finish first
+```
+
+### Output modes
+
+```bash
+sf search "query"                       # default: colored snippets with context
+sf search -c "query"                    # count only (instant, no file I/O)
+sf search --files-only "query"          # file paths only (like rg -l)
+sf search -j "query"                    # JSON output (for scripts/AI agents)
+```
 
 ### Search file paths
 
-`sf search-file` does a case-insensitive substring match on indexed file paths.
-
 ```bash
-sf search-file "config"
-sf search-file --wait "daemon"
+sf search-file "config"                 # case-insensitive substring match
+sf search-file "Cargo.toml"
 ```
 
-### Build and watch the index explicitly
-
-You can start warming the index before the first search:
+## Index Management
 
 ```bash
-sf index build
-sf index watch
-sf index status
+sf index build                          # start background daemon + indexing
+sf index watch                          # foreground indexing with live progress bar
+sf index status                         # show build progress and ETA
 ```
 
-`sf index build` starts the background daemon and kicks off indexing. `sf index watch` shows a live progress line with scan mode, processed files/bytes, and ETA.
+`sf index watch` shows a 60fps live display:
+```
+⠹ git-initial [████████████░░░░░░░░░░░░░░░░░░] 3450/9467 (36%)  101/257 MB  ETA 29s  315 files/sec
+  DockerManagementViewModel.cs
+```
 
-### Inspect and control daemons
+## Daemon Management
 
 ```bash
-sf status
-sf daemon status
-sf list
-sf stop
-sf stop --all
+sf status                               # daemon + index status
+sf stop                                 # stop the background daemon
+sf stop --all                           # stop all known daemons
+sf daemon list                          # list all running daemons
 ```
 
-The status output includes root, PID, version, index status, scan mode, progress, current file, and leader lease information.
-
-### Run the MCP server
+## MCP Server
 
 ```bash
-sf server
+sf server --root /path/to/repo
 ```
 
-The MCP server communicates over stdio and maintains the index in the background. Leader election ensures only one process writes to the index at a time.
-
-## MCP Integration
-
-Example Claude Desktop configuration:
+Claude Desktop configuration:
 
 ```json
 {
@@ -136,51 +87,75 @@ Example Claude Desktop configuration:
 }
 ```
 
-### Available MCP Tools
+The MCP server exposes a `search_code` tool with `query` and optional `file_regex` parameters. Leader election ensures only one process writes to the index at a time.
 
-- `search_code`
-  - `query`: required substring query
-  - `file_regex`: optional regex applied to result file paths
+## AI Agent Integration
 
-If the index is still building, the server returns a warning that results may be stale or incomplete.
+```bash
+sf --skill                              # print LLM skill description
+sf search -j "query"                    # JSON output for parsing
+sf search -c "query"                    # count for quick checks
+sf search --files-only "query"          # file list for iteration
+```
+
+`sf --skill` outputs a structured skill document that AI agents can read to learn the full CLI interface.
 
 ## How It Works
 
-1. Files are scanned and converted into trigrams (3-byte substrings).
-2. The index stores trigram-to-file mappings in LMDB, using Roaring bitmaps for efficient intersections.
-3. On startup, the daemon performs a git-aware scan:
-   - first run: git index/worktree driven initial scan when possible
-   - later runs: incremental HEAD diff plus worktree changes
-   - fallback: full filesystem scan if git state is unavailable or diffing fails
-4. A background watcher keeps the index updated for file create/modify/delete events.
-5. Search intersects trigram bitmaps, then extracts snippets from matching files for display.
+1. **Trigram indexing**: every 3-byte sequence in every file is stored in an inverted index
+2. **LMDB storage**: Roaring bitmaps map trigrams to file IDs; LMDB provides concurrent multi-process reads
+3. **Git-aware scanning**:
+   - First run: git index/worktree scan
+   - Later runs: incremental HEAD diff + worktree changes
+   - Fallback: full filesystem scan if git is unavailable
+4. **Background daemon**: file watcher keeps the index updated on create/modify/delete
+5. **Search**: bitmap intersection finds candidates, then snippet extraction verifies matches
+
+## Workspace Layout
+
+```
+app/       — sf CLI binary, daemon, MCP server
+core/      — persistent index, trigram search, LMDB storage
+fs/        — filesystem scanning, git diff, file watcher
+progress/  — shared scan progress types
+scripts/   — benchmark harness
+```
 
 ## Environment Variables
 
-- `SOURCE_FAST_LOG_PATH`: append CLI or MCP logs to a file; if unset, those commands stay quiet by default
-- `RUST_LOG`: tracing filter, such as `info`, `debug`, or `warn`
+| Variable | Purpose |
+|----------|---------|
+| `SOURCE_FAST_LOG_PATH` | Append CLI/MCP logs to this file (silent by default) |
+| `RUST_LOG` | Tracing filter: `info`, `debug`, `warn` |
 
-Daemon logs are written to `.source_fast/daemon.log`.
+Daemon logs are always written to `.source_fast/daemon.log`.
+
+## Index Storage
+
+```
+.source_fast/
+├── index.mdb/          ← LMDB environment (data.mdb + lock.mdb)
+├── daemon.log
+└── .shutdown_requested  ← signal file for graceful stop
+```
 
 ## Limitations
 
-- Content queries must be at least 3 bytes long
-- Content search is substring-based; there is no regex content search
-- Binary files are skipped
-- Non-git directories fall back to full-scan behavior
-- Results can be temporarily stale while the initial background index build is still running
+- Queries must be at least 3 characters
+- Content search is substring-based (no regex content search)
+- Binary files are skipped (null byte in first 1024 bytes)
+- LMDB map size is fixed at 1 GB (covers most repositories)
+- Results may be partial during initial index build
 
 ## Testing
 
-The app crate includes end-to-end coverage for:
+164 tests: 64 unit + 17 fs + 83 end-to-end covering search, filesystem, git, leader election, MCP, worktree, resilience, and edge cases.
 
-- basic search behavior
-- filesystem updates
-- git-aware scanning
-- leader election and daemon readiness
-- MCP readiness
-- worktree behavior
-- resilience and edge cases
+```bash
+cargo test                              # run all tests
+cargo test -p source_fast_core          # unit tests only
+cargo test -p source_fast --test e2e_basic  # specific E2E suite
+```
 
 ## License
 
