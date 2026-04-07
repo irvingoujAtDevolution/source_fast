@@ -32,6 +32,9 @@ enum DaemonCommand {
         /// Path to database file
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Stop all known daemons across all repositories
+        #[arg(long)]
+        all: bool,
     },
     /// List all running daemons.
     List,
@@ -111,7 +114,7 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
         /// Path to database file
-        #[arg(long)]
+        #[arg(long, hide = true)]
         db: Option<PathBuf>,
         /// Block until the index is fully built before returning results
         #[arg(long)]
@@ -119,30 +122,7 @@ enum Command {
         /// Pattern to match file paths (case-insensitive substring)
         pattern: String,
     },
-    /// Stop the daemon for this repository.
-    Stop {
-        /// Root directory
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Path to database file
-        #[arg(long)]
-        db: Option<PathBuf>,
-        /// Stop all known daemons
-        #[arg(long)]
-        all: bool,
-    },
-    /// Show daemon and index status for this repository, including scan progress and ETA.
-    #[command(visible_aliases = ["index-status", "daemon-status"])]
-    Status {
-        /// Root directory
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Path to database file
-        #[arg(long)]
-        db: Option<PathBuf>,
-    },
     /// Daemon management commands.
-    // Intentional typo-tolerant alias for users who misspell "daemon".
     #[command(visible_alias = "deamon")]
     Daemon {
         #[command(subcommand)]
@@ -153,8 +133,6 @@ enum Command {
         #[command(subcommand)]
         command: IndexCommand,
     },
-    /// List all running daemons.
-    List,
     /// Run MCP server over stdio.
     Server {
         /// Root directory to index and watch
@@ -245,23 +223,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing_cli();
             run_file_search_with_daemon(root, db, pattern, wait).await?;
         }
-        Command::Stop { root, db, all } => {
-            init_tracing_cli();
-            if all {
-                run_stop_all().await?;
-            } else {
-                run_stop(root, db).await?;
-            }
-        }
-        Command::Status { root, db } => {
-            init_tracing_cli();
-            run_status(root, db).await?;
-        }
         Command::Daemon { command } => {
             init_tracing_cli();
             match command {
                 DaemonCommand::Status { root, db } => run_status(root, db).await?,
-                DaemonCommand::Stop { root, db } => run_stop(root, db).await?,
+                DaemonCommand::Stop { root, db, all } => {
+                    if all {
+                        run_stop_all().await?;
+                    } else {
+                        run_stop(root, db).await?;
+                    }
+                }
                 DaemonCommand::List => run_list().await?,
             }
         }
@@ -273,16 +245,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 IndexCommand::Watch { root, db } => run_index_watch(root, db).await?,
             }
         }
-        Command::List => {
-            init_tracing_cli();
-            run_list().await?;
-        }
         Command::Server { root, db } => {
             init_tracing_server();
             run_server(root, db).await?;
         }
         Command::InternalDaemon { root, db } => {
-            // Tracing is initialized inside run_daemon (goes to daemon.log).
             let root = root.unwrap_or_else(default_root);
             let db_path = db.unwrap_or_else(|| default_db_path(&root));
             daemon::run_daemon(root, db_path).await?;

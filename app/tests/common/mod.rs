@@ -187,6 +187,7 @@ impl TestFixture {
     pub fn stop(&self) {
         let _ = self
             .sf()
+            .arg("daemon")
             .arg("stop")
             .arg("--root")
             .arg(self.root())
@@ -211,11 +212,12 @@ impl TestFixture {
     /// Get the daemon status for this repo.
     pub fn status(&self) -> std::process::Output {
         self.sf()
+            .arg("daemon")
             .arg("status")
             .arg("--root")
             .arg(self.root())
             .output()
-            .expect("sf status failed")
+            .expect("sf daemon status failed")
     }
 }
 
@@ -223,6 +225,7 @@ impl Drop for TestFixture {
     fn drop(&mut self) {
         // Clean up any daemon process running for this repo.
         let _ = StdCommand::new(env!("CARGO_BIN_EXE_sf"))
+            .arg("daemon")
             .arg("stop")
             .arg("--root")
             .arg(self.dir.path())

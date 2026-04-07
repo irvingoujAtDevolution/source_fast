@@ -51,7 +51,7 @@ pub fn file_modified_timestamp(path: &Path) -> u64 {
 pub fn normalize_path(path: &Path) -> String {
     // Try direct canonicalization first (file exists)
     if let Ok(p) = path.canonicalize() {
-        return p.to_string_lossy().into_owned();
+        return strip_unc_prefix(&p.to_string_lossy());
     }
 
     // File doesn't exist - canonicalize parent and append filename
@@ -59,14 +59,25 @@ pub fn normalize_path(path: &Path) -> String {
         && let Ok(canonical_parent) = parent.canonicalize()
         && let Some(file_name) = path.file_name()
     {
-        return canonical_parent
-            .join(file_name)
-            .to_string_lossy()
-            .into_owned();
+        let joined = canonical_parent.join(file_name);
+        return strip_unc_prefix(&joined.to_string_lossy());
     }
 
     // Ultimate fallback
     path.to_string_lossy().into_owned()
+}
+
+/// Strip the `\\?\` extended-length path prefix that `fs::canonicalize` adds
+/// on Windows, and normalize forward slashes to backslashes. Without this,
+/// paths from gix (forward slashes) and canonicalize (`\\?\` prefix) don't
+/// match paths stored during packfile scanning.
+fn strip_unc_prefix(path: &str) -> String {
+    if cfg!(windows) {
+        let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
+        stripped.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
 }
 
 pub fn extract_snippet(path: &Path, query: &str) -> std::io::Result<Option<Snippet>> {

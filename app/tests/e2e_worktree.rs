@@ -98,6 +98,7 @@ fn sf_search(root: &Path, query: &str) -> String {
 fn sf_stop(root: &Path) {
     let _ = Command::cargo_bin("sf")
         .unwrap()
+        .arg("daemon")
         .arg("stop")
         .arg("--root")
         .arg(root)

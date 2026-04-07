@@ -680,7 +680,14 @@ fn initial_git_scan_with_progress(
     progress(ScanEvent::PhaseChanged("reading packfile".into()));
 
     // Phase 2a: Read all blobs from packfile (sequential — gix is !Sync).
-    let workdir_str = workdir.display().to_string();
+    // Normalize workdir slashes: gix may return forward slashes on Windows
+    // (e.g. "C:/Users/...") but normalize_path and Path::join use backslashes.
+    // Without this, remove_path lookups fail due to slash mismatches.
+    let workdir_str = if cfg!(windows) {
+        workdir.display().to_string().replace('/', "\\")
+    } else {
+        workdir.display().to_string()
+    };
     let sep = std::path::MAIN_SEPARATOR;
 
     info!("initial_git_scan: reading blobs from packfile...");
