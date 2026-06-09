@@ -31,7 +31,10 @@ pub enum ScanEvent {
     /// Does NOT reset counters — only updates the display label.
     PhaseChanged(String),
     FileStarted(String),
-    FileFinished { path: String, bytes: u64 },
+    FileFinished {
+        path: String,
+        bytes: u64,
+    },
     Finished,
     Failed,
 }

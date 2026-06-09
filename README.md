@@ -149,7 +149,7 @@ Daemon logs are always written to `.source_fast/daemon.log`.
 
 ## Testing
 
-164 tests: 64 unit + 17 fs + 83 end-to-end covering search, filesystem, git, leader election, MCP, worktree, resilience, and edge cases.
+175 tests: 66 core + 17 fs + 92 end-to-end covering search, filesystem, git, leader election, MCP, worktree, resilience, and edge cases.
 
 ```bash
 cargo test                              # run all tests

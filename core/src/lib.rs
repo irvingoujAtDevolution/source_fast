@@ -12,4 +12,7 @@ pub use storage::{
     read_meta_readonly, rewrite_root_paths, search_database_file, search_database_file_filtered,
     search_files_in_database,
 };
-pub use text::extract_snippet;
+pub use text::{
+    extract_snippet, extract_snippets, normalize_path, normalize_path_for_prefix,
+    path_is_within_root,
+};

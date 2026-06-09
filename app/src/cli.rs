@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use source_fast_core::{
-    IndexError, PersistentIndex, extract_snippet, is_leader_active_readonly, now_millis,
-    read_meta_readonly, rewrite_root_paths, search_database_file_filtered,
-    search_files_in_database,
+    IndexError, PersistentIndex, extract_snippets, is_leader_active_readonly, normalize_path,
+    normalize_path_for_prefix, now_millis, path_is_within_root, read_meta_readonly,
+    rewrite_root_paths, search_database_file_filtered, search_files_in_database,
 };
 use source_fast_fs::smart_scan_with_progress;
 use source_fast_progress::{IndexProgress, ScanEvent};
@@ -18,12 +18,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon;
 
+const INDEX_ROOT_META: &str = "index_root";
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
 
 pub fn default_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn resolve_root(root: Option<PathBuf>) -> PathBuf {
+    let root = root.unwrap_or_else(default_root);
+    root.canonicalize().unwrap_or(root)
 }
 
 pub fn default_db_path(root: &Path) -> PathBuf {
@@ -517,6 +524,62 @@ fn same_path(lhs: &Path, rhs: &Path) -> bool {
     }
 }
 
+fn roots_equivalent(lhs: &str, rhs: &str) -> bool {
+    normalize_path_for_prefix(lhs) == normalize_path_for_prefix(rhs)
+}
+
+fn set_index_root(index: &PersistentIndex, root: &Path) -> Result<(), IndexError> {
+    index.set_meta(INDEX_ROOT_META, &normalize_path(root))
+}
+
+fn validate_index_for_root(index: &PersistentIndex, root: &Path) -> Result<bool, IndexError> {
+    let expected_root = normalize_path(root);
+    if let Some(stored_root) = index.get_meta(INDEX_ROOT_META)?
+        && !roots_equivalent(&stored_root, &expected_root)
+    {
+        warn!(
+            stored_root = %stored_root,
+            expected_root = %expected_root,
+            "index root metadata does not match requested root"
+        );
+        return Ok(false);
+    }
+
+    let outside = index.count_paths_outside_root(root)?;
+    if outside > 0 {
+        warn!(
+            root = %expected_root,
+            outside_paths = outside,
+            "index contains paths outside requested root"
+        );
+        return Ok(false);
+    }
+
+    set_index_root(index, root)?;
+    Ok(true)
+}
+
+fn repair_index_for_root(
+    db_path: &Path,
+    root: &Path,
+    old_roots: Vec<PathBuf>,
+) -> Result<Option<PersistentIndex>, IndexError> {
+    for old_root in old_roots {
+        if same_path(&old_root, root) {
+            continue;
+        }
+
+        rewrite_root_paths(db_path, &old_root, root)?;
+        let index = PersistentIndex::open_or_create(db_path)?;
+        if validate_index_for_root(&index, root)? {
+            return Ok(Some(index));
+        }
+        drop(index);
+    }
+
+    Ok(None)
+}
+
 /// Copy the LMDB data file from `source_root`'s index to `db_path`.
 /// Only copies `data.mdb` (not `lock.mdb` which is process-local).
 ///
@@ -566,7 +629,29 @@ pub(crate) fn open_index_with_worktree_copy(
 
     if db_path.exists() {
         match PersistentIndex::open_or_create(db_path) {
-            Ok(index) => return Ok(index),
+            Ok(index) => {
+                let stored_root = index.get_meta(INDEX_ROOT_META).ok().flatten();
+                if validate_index_for_root(&index, root)? {
+                    return Ok(index);
+                }
+
+                drop(index);
+
+                let mut repair_roots = Vec::new();
+                if let Some(stored_root) = stored_root {
+                    repair_roots.push(PathBuf::from(stored_root));
+                }
+                if let Some(primary_root) = primary_worktree_root(root)
+                    && !same_path(&primary_root, root)
+                {
+                    repair_roots.push(primary_root);
+                }
+                if let Some(index) = repair_index_for_root(db_path, root, repair_roots)? {
+                    return Ok(index);
+                }
+
+                remove_db_files(db_path);
+            }
             Err(err) => {
                 if !is_corrupt_db(&err) {
                     return Err(err);
@@ -577,19 +662,36 @@ pub(crate) fn open_index_with_worktree_copy(
     }
 
     if let Some(primary_root) = copy_db_from_primary_worktree(root, db_path) {
-        let _ = rewrite_root_paths(db_path, &primary_root, root);
-        match PersistentIndex::open_or_create(db_path) {
-            Ok(index) => return Ok(index),
-            Err(err) => {
-                if !is_corrupt_db(&err) {
-                    return Err(err);
+        if let Err(err) = rewrite_root_paths(db_path, &primary_root, root) {
+            warn!(
+                source_root = %primary_root.display(),
+                root = %root.display(),
+                error = ?err,
+                "failed to rewrite copied worktree index; rebuilding instead"
+            );
+            remove_db_files(db_path);
+        } else {
+            match PersistentIndex::open_or_create(db_path) {
+                Ok(index) => {
+                    if validate_index_for_root(&index, root)? {
+                        return Ok(index);
+                    }
+                    drop(index);
+                    remove_db_files(db_path);
                 }
-                remove_db_files(db_path);
+                Err(err) => {
+                    if !is_corrupt_db(&err) {
+                        return Err(err);
+                    }
+                    remove_db_files(db_path);
+                }
             }
         }
     }
 
-    PersistentIndex::open_or_create(db_path)
+    let index = PersistentIndex::open_or_create(db_path)?;
+    set_index_root(&index, root)?;
+    Ok(index)
 }
 
 // ---------------------------------------------------------------------------
@@ -698,11 +800,9 @@ pub struct SearchOpts {
     pub count: bool,
 }
 
-pub async fn run_search_with_daemon(
-    opts: SearchOpts,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_search_with_daemon(opts: SearchOpts) -> Result<(), Box<dyn std::error::Error>> {
     let command_started = Instant::now();
-    let root = opts.root.unwrap_or_else(default_root);
+    let root = resolve_root(opts.root);
     let db_path = opts.db.unwrap_or_else(|| default_db_path(&root));
     let query = opts.query;
     let limit = opts.limit;
@@ -793,6 +893,7 @@ pub async fn run_search_with_daemon(
             std::process::exit(1);
         }
     };
+    hits.retain(|hit| path_is_within_root(&hit.path, &root));
     hits.sort_by(|a, b| a.path.cmp(&b.path));
 
     let total = hits.len();
@@ -825,7 +926,7 @@ pub async fn run_search_with_daemon(
 
     // ---- Default: streaming rg-style output with snippets ----
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<source_fast_core::Snippet>)>(32);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Vec<source_fast_core::Snippet>)>(32);
 
     let query_for_workers = query.clone();
     let done_for_workers = Arc::clone(&done);
@@ -836,8 +937,8 @@ pub async fn run_search_with_daemon(
                 return;
             }
             let path = PathBuf::from(&hit.path);
-            let snippet = extract_snippet(&path, &query_for_workers).ok().flatten();
-            if tx.send((hit.path.clone(), snippet)).is_err() {
+            let snippets = extract_snippets(&path, &query_for_workers).unwrap_or_default();
+            if tx.send((hit.path.clone(), snippets)).is_err() {
                 done_for_workers.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
@@ -846,9 +947,9 @@ pub async fn run_search_with_daemon(
     let mut printed = 0usize;
     let mut no_snippet_paths: Vec<String> = Vec::new();
 
-    for (path, snippet) in &rx {
-        match snippet {
-            Some(snippet) => {
+    for (path, snippets) in &rx {
+        if !snippets.is_empty() {
+            for snippet in snippets {
                 let path_str = snippet.path.display().to_string();
                 let display_path = clean_display_path(&path_str);
                 println!("\x1b[35m{display_path}\x1b[0m:{}", snippet.line_number);
@@ -861,11 +962,10 @@ pub async fn run_search_with_daemon(
                     }
                 }
                 println!();
-                printed += 1;
             }
-            None => {
-                no_snippet_paths.push(path);
-            }
+            printed += 1;
+        } else {
+            no_snippet_paths.push(path);
         }
         if printed + no_snippet_paths.len() >= display_limit {
             break;
@@ -903,12 +1003,12 @@ fn print_json_results(
         }
         let path = PathBuf::from(&hit.path);
         let display_path = clean_display_path(&hit.path).to_string();
-        let snippet = extract_snippet(&path, query).ok().flatten();
+        let snippets = extract_snippets(&path, query).unwrap_or_default();
         let mut entry = json!({
             "path": display_path,
             "file_id": hit.file_id,
         });
-        if let Some(snippet) = snippet {
+        if let Some(snippet) = snippets.first() {
             entry["line"] = Value::from(snippet.line_number);
             entry["snippet"] = Value::from(
                 snippet
@@ -918,6 +1018,21 @@ fn print_json_results(
                     .collect::<Vec<_>>(),
             );
         }
+        entry["snippets"] = Value::from(
+            snippets
+                .iter()
+                .map(|snippet| {
+                    json!({
+                        "line": snippet.line_number,
+                        "lines": snippet
+                            .lines
+                            .iter()
+                            .map(|(n, l)| json!({"line": n, "text": l}))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         results.push(entry);
     }
     let output = json!({
@@ -936,7 +1051,7 @@ pub async fn run_file_search_with_daemon(
     wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let command_started = Instant::now();
-    let root = root.unwrap_or_else(default_root);
+    let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
     let first_time = !db_path.exists();
@@ -1001,13 +1116,14 @@ pub async fn run_file_search_with_daemon(
         return Ok(());
     }
 
-    let hits = match search_files_in_database(&db_path, &pattern) {
+    let mut hits = match search_files_in_database(&db_path, &pattern) {
         Ok(h) => h,
         Err(err) => {
             error!(db = %db_path.display(), pattern = %pattern, error = ?err, "search-file command failed");
             std::process::exit(1);
         }
     };
+    hits.retain(|hit| path_is_within_root(&hit.path, &root));
 
     info!(
         db = %db_path.display(),
@@ -1089,7 +1205,7 @@ pub async fn run_stop(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = root.unwrap_or_else(default_root);
+    let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
     info!(root = %root.display(), db = %db_path.display(), "stop command requested");
     daemon::stop_daemon(&db_path)?;
@@ -1115,7 +1231,7 @@ pub async fn run_status(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = root.unwrap_or_else(default_root);
+    let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
     info!(root = %root.display(), db = %db_path.display(), "status command requested");
 
@@ -1213,7 +1329,7 @@ pub async fn run_index_build(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = root.unwrap_or_else(default_root);
+    let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
     let was_running = daemon::ensure_daemon(&root, &db_path)?;
@@ -1235,7 +1351,7 @@ pub async fn run_index_watch(
     root: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = root.unwrap_or_else(default_root);
+    let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
 
     if !db_path.exists() {

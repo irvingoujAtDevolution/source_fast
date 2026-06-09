@@ -5,8 +5,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use source_fast_core::PersistentIndex;
-use source_fast_fs::{background_watcher, smart_scan_with_progress};
+use source_fast_core::{IndexError, PersistentIndex};
+use source_fast_fs::{background_watcher_with_cancel, smart_scan_with_progress_cancel};
 use source_fast_progress::{IndexProgress, ScanEvent};
 use tokio::task;
 use tracing::{debug, error, info, warn};
@@ -89,6 +89,53 @@ fn now_ms() -> u64 {
     source_fast_core::now_millis().max(0) as u64
 }
 
+pub(crate) fn writer_holder_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("pid:{}:{nanos}", std::process::id())
+}
+
+pub(crate) async fn try_acquire_writer_lease(
+    index: Arc<PersistentIndex>,
+    holder: String,
+    lease_ttl: Duration,
+    component: &'static str,
+) -> bool {
+    match task::spawn_blocking(move || index.try_acquire_writer_lease(&holder, lease_ttl)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            warn!(component, error = %err, "writer lease acquire failed");
+            false
+        }
+        Err(join_err) => {
+            warn!(component, error = %join_err, "writer lease acquire task panicked");
+            false
+        }
+    }
+}
+
+pub(crate) async fn renew_writer_lease(
+    index: Arc<PersistentIndex>,
+    holder: String,
+    lease_ttl: Duration,
+    component: &'static str,
+) -> bool {
+    match task::spawn_blocking(move || index.renew_writer_lease(&holder, lease_ttl)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            warn!(component, error = %err, "writer lease renew failed");
+            false
+        }
+        Err(join_err) => {
+            warn!(component, error = %join_err, "writer lease renew task panicked");
+            false
+        }
+    }
+}
+
 fn persist_progress(index: &PersistentIndex, progress: &IndexProgress) {
     if let Ok(json) = serde_json::to_string(progress) {
         let _ = index.set_meta(meta_keys::INDEX_PROGRESS, &json);
@@ -168,20 +215,14 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
     let _ = register_daemon(&root, &db_path, std::process::id());
 
     // Leader election setup (same pattern as mcp.rs lines 148-156).
-    let holder = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("pid:{}:{nanos}", std::process::id())
-    };
+    let holder = writer_holder_id();
     let lease_ttl = Duration::from_secs(5);
     let is_writer = Arc::new(AtomicBool::new(false));
     let index_ready = Arc::new(AtomicBool::new(false));
     persist_progress(&index, &IndexProgress::building(now_ms()));
 
     let mut writer_started = false;
+    let mut writer_cancel: Option<Arc<AtomicBool>> = None;
     let mut give_up_count = 0u32;
     // If we cannot acquire the lease after 20 iterations (10 s), another
     // daemon or MCP server already owns this repo.
@@ -203,25 +244,10 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
         }
 
         // ---- Leader election ----
-        // TODO: extract shared election/writer lifecycle into a reusable helper (duplicated in mcp.rs)
         if !is_writer.load(Ordering::SeqCst) {
-            let idx = Arc::clone(&index);
-            let holder_clone = holder.clone();
-            let acquired = match task::spawn_blocking(move || {
-                idx.try_acquire_writer_lease(&holder_clone, lease_ttl)
-            })
-            .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(err)) => {
-                    warn!("daemon: lease acquire failed: {err}");
-                    false
-                }
-                Err(join_err) => {
-                    warn!("daemon: lease acquire task panicked: {join_err}");
-                    false
-                }
-            };
+            let acquired =
+                try_acquire_writer_lease(Arc::clone(&index), holder.clone(), lease_ttl, "daemon")
+                    .await;
 
             if acquired {
                 index.set_write_enabled(true);
@@ -241,6 +267,8 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
         if is_writer.load(Ordering::SeqCst) {
             if !writer_started {
                 writer_started = true;
+                let cancel = Arc::new(AtomicBool::new(false));
+                writer_cancel = Some(Arc::clone(&cancel));
 
                 // Kick off initial scan.
                 let index_for_scan = Arc::clone(&index);
@@ -248,6 +276,7 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                 let root_for_scan = root.clone();
                 let ready_for_scan = Arc::clone(&index_ready);
                 let index_for_progress = Arc::clone(&index);
+                let cancel_for_scan = Arc::clone(&cancel);
                 task::spawn(async move {
                     let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
                     let progress_thread = std::thread::spawn(move || {
@@ -278,7 +307,12 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                             let _ = progress_tx.send(event);
                         });
                     let res = task::spawn_blocking(move || {
-                        smart_scan_with_progress(&root_for_scan, index_for_scan, progress_callback)
+                        smart_scan_with_progress_cancel(
+                            &root_for_scan,
+                            index_for_scan,
+                            progress_callback,
+                            cancel_for_scan,
+                        )
                     })
                     .await;
                     match res {
@@ -288,6 +322,11 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                             drop(final_progress_tx);
                             let _ = progress_thread.join();
                             info!("daemon: initial index build completed");
+                        }
+                        Ok(Err(IndexError::Cancelled)) => {
+                            drop(final_progress_tx);
+                            let _ = progress_thread.join();
+                            info!("daemon: initial index build cancelled");
                         }
                         Ok(Err(err)) => {
                             let _ = final_progress_tx.send(ScanEvent::Failed);
@@ -325,8 +364,14 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                 // Start file watcher.
                 let index_for_watcher = Arc::clone(&index);
                 let root_for_watcher = root.clone();
+                let cancel_for_watcher = Arc::clone(&cancel);
                 task::spawn(async move {
-                    if let Err(err) = background_watcher(root_for_watcher, index_for_watcher).await
+                    if let Err(err) = background_watcher_with_cancel(
+                        root_for_watcher,
+                        index_for_watcher,
+                        cancel_for_watcher,
+                    )
+                    .await
                     {
                         error!("daemon: file watcher stopped: {err}");
                     }
@@ -334,29 +379,13 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
             }
 
             // Renew lease.
-            let idx = Arc::clone(&index);
-            let holder_clone = holder.clone();
-            let renewed = match task::spawn_blocking(move || {
-                idx.renew_writer_lease(&holder_clone, lease_ttl)
-            })
-            .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(err)) => {
-                    warn!("daemon: lease renew failed: {err}");
-                    false
-                }
-                Err(join_err) => {
-                    warn!("daemon: lease renew task panicked: {join_err}");
-                    false
-                }
-            };
+            let renewed =
+                renew_writer_lease(Arc::clone(&index), holder.clone(), lease_ttl, "daemon").await;
 
             if !renewed {
-                // TODO: cancel outstanding scan/watcher tasks from the previous
-                // writer generation to avoid resource leaks on lease flip-flop.
-                // Requires passing a cancellation flag to smart_scan_with_progress
-                // and background_watcher.
+                if let Some(cancel) = writer_cancel.take() {
+                    cancel.store(true, Ordering::SeqCst);
+                }
                 index.set_write_enabled(false);
                 is_writer.store(false, Ordering::SeqCst);
                 writer_started = false;
@@ -370,6 +399,9 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
 
     // Cleanup: release the leader lease so `is_leader_active()` returns
     // false immediately (no need to wait for TTL expiry).
+    if let Some(cancel) = writer_cancel.take() {
+        cancel.store(true, Ordering::SeqCst);
+    }
     let _ = index.release_writer_lease(&holder);
     let _ = deregister_daemon(&root);
     let shutdown_file = shutdown_signal_path(&db_path);

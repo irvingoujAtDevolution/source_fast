@@ -7,7 +7,7 @@ mod daemon;
 mod mcp;
 
 use crate::cli::{
-    default_db_path, default_root, init_tracing_cli, init_tracing_server,
+    default_db_path, init_tracing_cli, init_tracing_server, resolve_root,
     run_file_search_with_daemon, run_index_build, run_index_watch, run_list,
     run_search_with_daemon, run_status, run_stop, run_stop_all,
 };
@@ -250,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_server(root, db).await?;
         }
         Command::InternalDaemon { root, db } => {
-            let root = root.unwrap_or_else(default_root);
+            let root = resolve_root(root);
             let db_path = db.unwrap_or_else(|| default_db_path(&root));
             daemon::run_daemon(root, db_path).await?;
         }

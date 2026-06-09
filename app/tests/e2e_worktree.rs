@@ -703,6 +703,56 @@ fn test_wt18_paths_are_absolute() {
     sf_stop(worktree_root);
 }
 
+/// WT21: Existing copied DBs with main-root slash variants must not leak main paths.
+#[test]
+fn test_wt21_existing_copied_db_rewrites_forward_slash_main_paths() {
+    let fix = TestFixture::new();
+    fix.git_init();
+    fix.add_file("src/main.rs", "fn real_file_wt21() {}");
+    fix.git_commit("initial");
+    let _ = fix.search("real_file_wt21");
+    sf_stop(&fix.root());
+
+    let main_root = fix.root();
+    let polluted_path = format!(
+        "{}/src/polluted.rs",
+        main_root.display().to_string().replace('\\', "/")
+    );
+    let index = PersistentIndex::open_or_create(&db_path(&main_root)).unwrap();
+    index
+        .index_content(
+            &polluted_path,
+            "fn polluted_forward_slash_path_wt21() {}",
+            1,
+        )
+        .unwrap();
+    index.flush().unwrap();
+    drop(index);
+
+    let worktree_dir = TempDir::new().unwrap();
+    let worktree_root = worktree_dir.path();
+    add_worktree(&fix, worktree_root, "HEAD");
+
+    let stdout = strip_ansi(&sf_search(
+        worktree_root,
+        "polluted_forward_slash_path_wt21",
+    ));
+    let main_root_str = main_root.display().to_string();
+    let main_root_forward = main_root_str.replace('\\', "/");
+    let worktree_root_str = worktree_root.display().to_string();
+
+    assert!(
+        stdout.contains(&worktree_root_str),
+        "Expected worktree path in output: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&main_root_str) && !stdout.contains(&main_root_forward),
+        "Output should not reference main root path: {stdout}"
+    );
+
+    sf_stop(worktree_root);
+}
+
 /// WT19: Performance guardrail for worktree copy (ignored by default).
 #[test]
 #[ignore = "Performance guardrail; run manually on large repos"]

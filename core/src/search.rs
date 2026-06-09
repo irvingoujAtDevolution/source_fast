@@ -7,23 +7,25 @@ use regex::Regex;
 use crate::IndexResult;
 use crate::model::{SearchHit, SearchResult};
 use crate::storage::search_database_file_filtered;
-use crate::text::extract_snippet;
+use crate::text::extract_snippets;
 
 pub fn attach_snippets(hits: Vec<SearchHit>, query: &str) -> Vec<SearchResult> {
     hits.into_par_iter()
         .map(|hit| {
             let path = PathBuf::from(&hit.path);
-            match extract_snippet(&path, query) {
-                Ok(snippet) => SearchResult {
+            match extract_snippets(&path, query) {
+                Ok(snippets) => SearchResult {
                     file_id: hit.file_id,
                     path: hit.path,
-                    snippet,
+                    snippet: snippets.first().cloned(),
+                    snippets,
                     snippet_error: None,
                 },
                 Err(err) => SearchResult {
                     file_id: hit.file_id,
                     path: hit.path,
                     snippet: None,
+                    snippets: Vec::new(),
                     snippet_error: Some(err.to_string()),
                 },
             }

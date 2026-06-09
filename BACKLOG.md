@@ -26,7 +26,7 @@ Items deferred from the initial development sessions. Ordered roughly by impact.
 ## Code Quality
 
 - [ ] **Extract shared election logic** — `daemon.rs` and `mcp.rs` have nearly identical leader election + scan + watcher code. Should be a shared helper. TODOs in both files.
-- [ ] **Scanner unit tests** — `fs/src/scanner.rs` has zero unit tests. The most complex logic (git diff, incremental scan, fallbacks) is only tested via E2E.
+- [ ] **Scanner test coverage depth** — `fs/src/scanner.rs` has focused tests now, but cancellation and platform-specific git status edge cases still need more coverage.
 - [ ] **Linux/macOS testing** — all development and testing happened on Windows. CI runs on all platforms but E2E tests may have platform-specific issues.
 - [ ] **S3 MCP test reliability** — the raw JSON-RPC test silently passes if the server is slow (single `read_line` with 500ms timeout).
 

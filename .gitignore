@@ -1,0 +1,9 @@
+target/
+target-bench*/
+.source_fast/
+.tmp/
+.claude/
+.serena/
+*.log
+*_benchmark.json
+step*_benchmark.json

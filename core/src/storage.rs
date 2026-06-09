@@ -18,9 +18,13 @@ use tracing::{debug, error, info};
 
 use crate::error::{IndexError, IndexResult};
 use crate::model::{SearchHit, SearchResult};
-use crate::text::{collect_trigrams, file_modified_timestamp, normalize_path, read_text_file};
+use crate::text::{
+    collect_trigrams, file_modified_timestamp, normalize_path, normalize_path_for_prefix,
+    path_is_within_root, read_text_file,
+};
 
-const MAP_SIZE: usize = 1024 * 1024 * 1024;
+const DEFAULT_MAP_SIZE: usize = 1024 * 1024 * 1024;
+const MAX_MAP_SIZE: usize = 1024 * 1024 * 1024 * 1024;
 const MAX_DBS: u32 = 6;
 const WRITER_LEADER_KEY: &str = "writer";
 
@@ -235,51 +239,58 @@ impl PersistentIndex {
             let _ = self.renew_writer_lease(&holder, Duration::from_secs(120));
         }
 
-        let result = (|| -> IndexResult<()> {
-            let mut wtxn = self.env.write_txn()?;
+        let mut attempt = 0usize;
+        let result = loop {
+            let result = (|| -> IndexResult<()> {
+                let mut wtxn = self.env.write_txn()?;
 
-            // Write files + files_by_path + file_trigrams
-            for (file_id, entry) in entries.iter().enumerate() {
-                let fid = file_id as u32;
-                let record = FileRecord {
-                    path: entry.path.clone(),
-                    last_modified: entry.modified_ts,
-                };
-                let encoded = encode_bytes(&record)?;
-                self.dbs.files.put(&mut wtxn, &fid, &encoded)?;
-                self.dbs
-                    .files_by_path
-                    .put(&mut wtxn, entry.path.as_str(), &fid)?;
-
-                if !entry.trigrams.is_empty() {
-                    let encoded_tri = encode_bytes(&entry.trigrams)?;
+                // Write files + files_by_path + file_trigrams
+                for (file_id, entry) in entries.iter().enumerate() {
+                    let fid = file_id as u32;
+                    let record = FileRecord {
+                        path: entry.path.clone(),
+                        last_modified: entry.modified_ts,
+                    };
+                    let encoded = encode_bytes(&record)?;
+                    self.dbs.files.put(&mut wtxn, &fid, &encoded)?;
                     self.dbs
-                        .file_trigrams
-                        .put(&mut wtxn, &fid, &encoded_tri)?;
+                        .files_by_path
+                        .put(&mut wtxn, entry.path.as_str(), &fid)?;
+
+                    if !entry.trigrams.is_empty() {
+                        let encoded_tri = encode_bytes(&entry.trigrams)?;
+                        self.dbs.file_trigrams.put(&mut wtxn, &fid, &encoded_tri)?;
+                    }
                 }
+
+                // Write trigrams in sorted key order for optimal B-tree insertion.
+                let mut sorted_trigrams: Vec<[u8; 3]> = trigram_map.keys().copied().collect();
+                sorted_trigrams.sort_unstable();
+
+                for trigram in &sorted_trigrams {
+                    if let Some(bitmap) = trigram_map.get(trigram) {
+                        let encoded = encode_bytes(bitmap)?;
+                        self.dbs.trigrams.put(&mut wtxn, &trigram[..], &encoded)?;
+                    }
+                }
+
+                wtxn.commit()?;
+                info!(
+                    files = entries.len(),
+                    trigrams = sorted_trigrams.len(),
+                    "bulk_cold_index_direct: committed"
+                );
+                Ok(())
+            })();
+
+            if matches!(result, Err(IndexError::MapFull)) && attempt == 0 {
+                attempt += 1;
+                resize_env_for_map_full(&self.env)?;
+                continue;
             }
 
-            // Write trigrams in sorted key order for optimal B-tree insertion.
-            let mut sorted_trigrams: Vec<[u8; 3]> = trigram_map.keys().copied().collect();
-            sorted_trigrams.sort_unstable();
-
-            for trigram in &sorted_trigrams {
-                if let Some(bitmap) = trigram_map.get(trigram) {
-                    let encoded = encode_bytes(bitmap)?;
-                    self.dbs
-                        .trigrams
-                        .put(&mut wtxn, &trigram[..], &encoded)?;
-                }
-            }
-
-            wtxn.commit()?;
-            info!(
-                files = entries.len(),
-                trigrams = sorted_trigrams.len(),
-                "bulk_cold_index_direct: committed"
-            );
-            Ok(())
-        })();
+            break result;
+        };
 
         // Resume writer thread regardless of success/failure.
         self.set_write_enabled(true);
@@ -518,6 +529,20 @@ impl PersistentIndex {
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
+
+    pub fn count_paths_outside_root(&self, root: &Path) -> IndexResult<usize> {
+        let rtxn = self.env.read_txn()?;
+        let mut outside = 0usize;
+        for entry in self.dbs.files.iter(&rtxn)? {
+            let (_file_id, value) = entry?;
+            let record: FileRecord = decode_bytes(value)?;
+            if !path_is_within_root(&record.path, root) {
+                outside += 1;
+            }
+        }
+        drop(rtxn);
+        Ok(outside)
+    }
 }
 
 impl Drop for PersistentIndex {
@@ -580,6 +605,30 @@ fn ensure_trailing_separator(path: &str) -> String {
     }
 }
 
+fn normalize_index_path_string(path: &str) -> String {
+    if cfg!(windows) {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
+fn path_suffix_after_root(path: &str, root: &Path) -> Option<String> {
+    let path_normalized = normalize_index_path_string(path);
+    let root_normalized = normalize_path(root);
+    let root_prefix = ensure_trailing_separator(&root_normalized);
+    let path_cmp = normalize_path_for_prefix(&path_normalized);
+    let root_cmp = normalize_path_for_prefix(&root_prefix);
+
+    if !path_cmp.starts_with(&root_cmp) {
+        return None;
+    }
+
+    Some(path_normalized[root_prefix.len()..].to_string())
+}
+
 pub(crate) fn diff_sorted_trigrams(
     old: &[[u8; 3]],
     new: &[[u8; 3]],
@@ -619,12 +668,11 @@ pub(crate) fn diff_sorted_trigrams(
 /// `PersistentIndex` is active for this `db_path` (no daemon or MCP
 /// server running). Called during worktree copy setup before a daemon starts.
 pub fn rewrite_root_paths(db_path: &Path, old_root: &Path, new_root: &Path) -> IndexResult<()> {
-    let old_norm = normalize_path(old_root);
     let new_norm = normalize_path(new_root);
-    let old_prefix = ensure_trailing_separator(&old_norm);
     let new_prefix = ensure_trailing_separator(&new_norm);
 
-    if old_prefix == new_prefix {
+    if normalize_path_for_prefix(&normalize_path(old_root)) == normalize_path_for_prefix(&new_norm)
+    {
         return Ok(());
     }
 
@@ -643,8 +691,7 @@ pub fn rewrite_root_paths(db_path: &Path, old_root: &Path, new_root: &Path) -> I
         for entry in iter {
             let (file_id, value) = entry?;
             let record: FileRecord = decode_bytes(value)?;
-            if record.path.starts_with(&old_prefix) {
-                let suffix = &record.path[old_prefix.len()..];
+            if let Some(suffix) = path_suffix_after_root(&record.path, old_root) {
                 let new_path = format!("{new_prefix}{suffix}");
                 updates.push((
                     file_id,
@@ -721,10 +768,11 @@ impl FileIdState {
 }
 
 fn open_env(path: &Path) -> IndexResult<Env> {
+    let map_size = map_size_for_path(path);
     unsafe {
         Ok(EnvOpenOptions::new()
             .max_dbs(MAX_DBS)
-            .map_size(MAP_SIZE)
+            .map_size(map_size)
             // WRITE_MAP: use writable mmap instead of write() syscalls,
             // letting the OS handle page flushing.
             // NO_META_SYNC: skip fsync of meta page on commit — only the
@@ -733,6 +781,35 @@ fn open_env(path: &Path) -> IndexResult<Env> {
             .flags(heed::EnvFlags::WRITE_MAP | heed::EnvFlags::NO_META_SYNC)
             .open(path)?)
     }
+}
+
+fn map_size_for_path(path: &Path) -> usize {
+    let data_len = std::fs::metadata(path.join("data.mdb"))
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    let wanted = data_len.saturating_mul(2).max(DEFAULT_MAP_SIZE);
+    wanted
+        .checked_next_power_of_two()
+        .unwrap_or(MAX_MAP_SIZE)
+        .min(MAX_MAP_SIZE)
+}
+
+fn resize_env_for_map_full(env: &Env) -> IndexResult<()> {
+    let current = env.info().map_size;
+    let next = current.saturating_mul(2).min(MAX_MAP_SIZE);
+    if next <= current {
+        return Err(IndexError::MapFull);
+    }
+
+    unsafe {
+        env.resize(next)?;
+    }
+    info!(
+        old_map_size = current,
+        new_map_size = next,
+        "resized LMDB map after map-full error"
+    );
+    Ok(())
 }
 
 fn create_databases(env: &Env) -> IndexResult<DbHandles> {
@@ -840,6 +917,15 @@ fn writer_loop(
 }
 
 fn process_batch(storage: &mut LmdbStorage, batch: Vec<IndexJob>, write_enabled: &AtomicBool) {
+    process_batch_inner(storage, batch, write_enabled, true);
+}
+
+fn process_batch_inner(
+    storage: &mut LmdbStorage,
+    batch: Vec<IndexJob>,
+    write_enabled: &AtomicBool,
+    allow_resize: bool,
+) {
     use IndexPayload::*;
 
     if !write_enabled.load(Ordering::SeqCst) {
@@ -904,12 +990,38 @@ fn process_batch(storage: &mut LmdbStorage, batch: Vec<IndexJob>, write_enabled:
 
     if let Some(err) = batch_error {
         drop(wtxn);
+        if matches!(err, IndexError::MapFull) && allow_resize {
+            match resize_env_for_map_full(&storage.env) {
+                Ok(()) => {
+                    process_batch_inner(storage, batch, write_enabled, false);
+                    return;
+                }
+                Err(resize_err) => {
+                    error!(error = %resize_err, "failed to resize LMDB map after batch map-full error");
+                    broadcast_batch_error(batch, resize_err);
+                    return;
+                }
+            }
+        }
         error!(error = %err, "index batch failed before commit");
         broadcast_batch_error(batch, err);
         return;
     }
 
     if let Err(err) = wtxn.commit() {
+        if matches!(err, heed::Error::Mdb(heed::MdbError::MapFull)) && allow_resize {
+            match resize_env_for_map_full(&storage.env) {
+                Ok(()) => {
+                    process_batch_inner(storage, batch, write_enabled, false);
+                    return;
+                }
+                Err(resize_err) => {
+                    error!(error = %resize_err, "failed to resize LMDB map after commit map-full error");
+                    broadcast_batch_error(batch, resize_err);
+                    return;
+                }
+            }
+        }
         error!(error = %err, "failed to commit index batch");
         broadcast_batch_error(batch, IndexError::Db(err.to_string()));
         return;
@@ -1569,6 +1681,44 @@ mod tests {
         assert!(
             !hits[0].path.contains("old_root"),
             "path should not contain old_root: {}",
+            hits[0].path
+        );
+    }
+
+    #[test]
+    fn test_rewrite_root_paths_handles_forward_slash_variant() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("index.mdb");
+        let index = PersistentIndex::open_or_create(&db_path).unwrap();
+
+        let old_root = temp_dir.path().join("old_root");
+        let new_root = temp_dir.path().join("new_root");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let stored_path = format!(
+            "{}/src/main.rs",
+            normalize_path(&old_root).replace('\\', "/")
+        );
+        index
+            .index_content(&stored_path, "fn forward_slash_rewrite_marker() {}", 1)
+            .unwrap();
+        index.flush().unwrap();
+        drop(index);
+
+        rewrite_root_paths(&db_path, &old_root, &new_root).unwrap();
+
+        let hits = search_database_file(&db_path, "forward_slash_rewrite_marker").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            path_is_within_root(&hits[0].path, &new_root),
+            "path should be rewritten under new root: {}",
+            hits[0].path
+        );
+        assert!(
+            !normalize_path_for_prefix(&hits[0].path)
+                .contains(&normalize_path_for_prefix(&normalize_path(&old_root))),
+            "path should not contain old root: {}",
             hits[0].path
         );
     }

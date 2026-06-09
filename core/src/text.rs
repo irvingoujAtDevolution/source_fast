@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,10 +22,7 @@ fn collect_trigrams_bytes(bytes: &[u8]) -> Vec<[u8; 3]> {
         return Vec::new();
     }
 
-    let mut result: Vec<[u8; 3]> = bytes
-        .windows(3)
-        .map(|w| [w[0], w[1], w[2]])
-        .collect();
+    let mut result: Vec<[u8; 3]> = bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
     result.sort_unstable();
     result.dedup();
     result
@@ -67,6 +63,39 @@ pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+pub fn normalize_path_for_prefix(path: &str) -> String {
+    let stripped = if cfg!(windows) {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', "\\")
+    } else {
+        path.to_string()
+    };
+
+    if cfg!(windows) {
+        stripped.to_ascii_lowercase()
+    } else {
+        stripped
+    }
+}
+
+fn ensure_trailing_separator(path: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    if path.ends_with(sep) {
+        path.to_string()
+    } else {
+        format!("{path}{sep}")
+    }
+}
+
+pub fn path_is_within_root(path: &str, root: &Path) -> bool {
+    let normalized_path = normalize_path_for_prefix(path);
+    let normalized_root = normalize_path_for_prefix(&normalize_path(root));
+    let root_prefix = ensure_trailing_separator(&normalized_root);
+
+    normalized_path == normalized_root || normalized_path.starts_with(&root_prefix)
+}
+
 /// Strip the `\\?\` extended-length path prefix that `fs::canonicalize` adds
 /// on Windows, and normalize forward slashes to backslashes. Without this,
 /// paths from gix (forward slashes) and canonicalize (`\\?\` prefix) don't
@@ -81,47 +110,38 @@ fn strip_unc_prefix(path: &str) -> String {
 }
 
 pub fn extract_snippet(path: &Path, query: &str) -> std::io::Result<Option<Snippet>> {
+    Ok(extract_snippets(path, query)?.into_iter().next())
+}
+
+pub fn extract_snippets(path: &Path, query: &str) -> std::io::Result<Vec<Snippet>> {
     use std::io::BufRead;
 
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let mut lines_iter = reader.lines().enumerate();
-    let mut buffer: VecDeque<(usize, String)> = VecDeque::new();
+    let lines: Vec<(usize, String)> = reader
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| line.map(|line| (idx + 1, line)))
+        .collect::<std::io::Result<_>>()?;
 
-    while let Some((idx, line_res)) = lines_iter.next() {
-        let line_no = idx + 1;
-        let line = line_res?;
-
-        if line.contains(query) {
-            let mut collected = Vec::new();
-            for (n, text) in &buffer {
-                collected.push((*n, text.clone()));
-            }
-            collected.push((line_no, line.clone()));
-
-            for _ in 0..2 {
-                if let Some((i, next_res)) = lines_iter.next() {
-                    let next_line = next_res?;
-                    collected.push((i + 1, next_line));
-                } else {
-                    break;
-                }
-            }
-
-            return Ok(Some(Snippet {
-                path: path.to_path_buf(),
-                line_number: line_no,
-                lines: collected,
-            }));
-        } else {
-            if buffer.len() == 2 {
-                buffer.pop_front();
-            }
-            buffer.push_back((line_no, line));
+    let mut snippets = Vec::new();
+    for (idx, (line_no, line)) in lines.iter().enumerate() {
+        if !line.contains(query) {
+            continue;
         }
+
+        let start = idx.saturating_sub(2);
+        let end = (idx + 3).min(lines.len());
+        let collected = lines[start..end].to_vec();
+
+        snippets.push(Snippet {
+            path: path.to_path_buf(),
+            line_number: *line_no,
+            lines: collected,
+        });
     }
 
-    Ok(None)
+    Ok(snippets)
 }
 
 #[cfg(test)]
@@ -423,6 +443,19 @@ mod tests {
         // Should return the first match
         assert_eq!(snippet.line_number, 1);
         assert!(snippet.lines[0].1.contains("first"));
+    }
+
+    #[test]
+    fn test_extract_snippets_returns_all_matches() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "first target").unwrap();
+        writeln!(file, "middle line").unwrap();
+        writeln!(file, "second target").unwrap();
+        file.flush().unwrap();
+
+        let snippets = extract_snippets(file.path(), "target").unwrap();
+        let lines: Vec<usize> = snippets.iter().map(|snippet| snippet.line_number).collect();
+        assert_eq!(lines, vec![1, 3]);
     }
 
     // ============ File Modified Timestamp Tests ============

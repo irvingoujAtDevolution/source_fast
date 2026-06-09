@@ -2808,6 +2808,7 @@ dependencies = [
  "ignore",
  "notify",
  "rayon",
+ "roaring",
  "source_fast_core",
  "source_fast_progress",
  "tempfile",

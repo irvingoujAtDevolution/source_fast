@@ -18,5 +18,6 @@ pub struct SearchResult {
     pub file_id: u32,
     pub path: String,
     pub snippet: Option<Snippet>,
+    pub snippets: Vec<Snippet>,
     pub snippet_error: Option<String>,
 }

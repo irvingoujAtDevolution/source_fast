@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use gix::Repository;
 use gix::bstr::ByteSlice;
 use gix::object::tree::diff::ChangeDetached;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use source_fast_core::{IndexError, PersistentIndex};
+use source_fast_core::{IndexError, PersistentIndex, path_is_within_root};
 use source_fast_progress::{ScanEvent, ScanMode, ScanPlan};
 use tracing::{debug, info, warn};
 
@@ -37,6 +37,13 @@ fn estimate_seconds(files: usize, bytes: u64) -> f64 {
     by_files.max(by_bytes)
 }
 
+fn check_cancel(cancel: &AtomicBool) -> Result<(), IndexError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(IndexError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Smart scan entry point.
 ///
 /// - If this is the first run (no `git_head` stored) or incremental diff fails,
@@ -55,11 +62,21 @@ pub fn smart_scan_with_progress(
     index: Arc<PersistentIndex>,
     progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
 ) -> Result<(), IndexError> {
+    smart_scan_with_progress_cancel(root, index, progress, Arc::new(AtomicBool::new(false)))
+}
+
+pub fn smart_scan_with_progress_cancel(
+    root: &Path,
+    index: Arc<PersistentIndex>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), IndexError> {
+    check_cancel(&cancel)?;
     let repo = match gix::discover(root) {
         Ok(repo) => repo,
         Err(err) => {
             debug!("smart_scan: no git repository detected: {err}, falling back to full scan");
-            return initial_scan_with_progress(root, index, progress);
+            return initial_scan_with_progress_cancel(root, index, progress, cancel);
         }
     };
 
@@ -67,7 +84,7 @@ pub fn smart_scan_with_progress(
         Ok(commit) => commit,
         Err(err) => {
             debug!("smart_scan: failed to read git HEAD commit: {err}, falling back to full scan");
-            return initial_scan_with_progress(root, index, progress);
+            return initial_scan_with_progress_cancel(root, index, progress, cancel);
         }
     };
 
@@ -116,7 +133,12 @@ pub fn smart_scan_with_progress(
                 Err(err) => {
                     warn!("smart_scan: incremental diff failed: {err}, falling back to full scan");
                     // Fallback: full scan, then store current HEAD.
-                    initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
+                    initial_scan_with_progress_cancel(
+                        root,
+                        Arc::clone(&index),
+                        Arc::clone(&progress),
+                        Arc::clone(&cancel),
+                    )?;
                     if let Err(err) = index.set_meta("git_head", &current_str) {
                         warn!("smart_scan: failed to store git_head in meta: {err}");
                     } else {
@@ -134,11 +156,13 @@ pub fn smart_scan_with_progress(
                 Arc::clone(&index),
                 &current_str,
                 Arc::clone(&progress),
+                Arc::clone(&cancel),
             )?;
             return Ok(());
         }
     }
 
+    check_cancel(&cancel)?;
     if candidates.is_empty() {
         progress(ScanEvent::Started(ScanPlan {
             mode: ScanMode::Incremental,
@@ -160,7 +184,13 @@ pub fn smart_scan_with_progress(
         total_files: candidate_files,
         total_bytes: candidate_bytes,
     }));
-    apply_changes_by_files_with_progress(root, &index, candidates, Arc::clone(&progress))?;
+    apply_changes_by_files_with_progress_cancel(
+        root,
+        &index,
+        candidates,
+        Arc::clone(&progress),
+        Arc::clone(&cancel),
+    )?;
     progress(ScanEvent::Finished);
 
     if let Err(err) = index.set_meta("git_head", &current_str) {
@@ -585,10 +615,13 @@ fn count_candidates(root: &Path, candidates: HashSet<PathBuf>) -> (usize, u64) {
     let mut bytes = 0u64;
 
     for path in candidates {
-        if !path.starts_with(root) {
+        let path_string = path.to_string_lossy();
+        if !path_is_within_root(&path_string, root) {
             continue;
         }
-        if path.starts_with(&exclude_dir) || path.starts_with(&git_dir) {
+        if path_is_within_root(&path_string, &exclude_dir)
+            || path_is_within_root(&path_string, &git_dir)
+        {
             continue;
         }
 
@@ -614,7 +647,9 @@ fn initial_git_scan_with_progress(
     index: Arc<PersistentIndex>,
     current_head: &str,
     progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), IndexError> {
+    check_cancel(&cancel)?;
     info!(
         "initial_git_scan: starting packfile-based scan at {}",
         workdir.display()
@@ -624,7 +659,12 @@ fn initial_git_scan_with_progress(
         Ok(r) => r,
         Err(err) => {
             warn!("initial_git_scan: failed to open repository: {err} – falling back to full walk");
-            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
+            initial_scan_with_progress_cancel(
+                root,
+                Arc::clone(&index),
+                Arc::clone(&progress),
+                Arc::clone(&cancel),
+            )?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
             } else {
@@ -639,7 +679,12 @@ fn initial_git_scan_with_progress(
         Ok(h) => h,
         Err(err) => {
             warn!("initial_git_scan: failed to get HEAD commit: {err} – falling back to full walk");
-            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
+            initial_scan_with_progress_cancel(
+                root,
+                Arc::clone(&index),
+                Arc::clone(&progress),
+                Arc::clone(&cancel),
+            )?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
             }
@@ -651,7 +696,12 @@ fn initial_git_scan_with_progress(
         Ok(id) => id,
         Err(err) => {
             warn!("initial_git_scan: failed to get tree id: {err} – falling back to full walk");
-            initial_scan_with_progress(root, Arc::clone(&index), Arc::clone(&progress))?;
+            initial_scan_with_progress_cancel(
+                root,
+                Arc::clone(&index),
+                Arc::clone(&progress),
+                Arc::clone(&cancel),
+            )?;
             if let Err(err) = index.set_meta("git_head", current_head) {
                 warn!("smart_scan: failed to store git_head in meta: {err}");
             }
@@ -698,6 +748,7 @@ fn initial_git_scan_with_progress(
     let mut read_count = 0usize;
 
     for (rel_path, oid) in &blob_entries {
+        check_cancel(&cancel)?;
         let Ok(obj) = repo.find_object(*oid) else {
             continue;
         };
@@ -730,7 +781,7 @@ fn initial_git_scan_with_progress(
             bytes: data.len() as u64,
         });
 
-        if read_count % 2000 == 0 {
+        if read_count.is_multiple_of(2000) {
             info!(
                 "initial_git_scan: read {read_count}/{total_files} files ({} MB) from packfile",
                 actual_bytes / (1024 * 1024)
@@ -756,9 +807,7 @@ fn initial_git_scan_with_progress(
     // Assign file_ids and extract trigrams in parallel.
     let file_trigrams: Vec<(String, Vec<[u8; 3]>)> = raw_files
         .par_iter()
-        .map(|(path, text)| {
-            (path.clone(), source_fast_core::text::collect_trigrams(text))
-        })
+        .map(|(path, text)| (path.clone(), source_fast_core::text::collect_trigrams(text)))
         .collect();
 
     // Build BulkFileEntry vec (sequential, trivial).
@@ -773,10 +822,12 @@ fn initial_git_scan_with_progress(
 
     // Build fixed-size trigram→bitmap array. Direct indexing, no hashing.
     // 16M entries × 8 bytes (empty RoaringBitmap) ≈ 128 MB.
-    let mut bitmaps: Vec<roaring::RoaringBitmap> =
-        (0..TRIGRAM_SPACE).map(|_| roaring::RoaringBitmap::new()).collect();
+    let mut bitmaps: Vec<roaring::RoaringBitmap> = (0..TRIGRAM_SPACE)
+        .map(|_| roaring::RoaringBitmap::new())
+        .collect();
 
     for (file_id, (_path, trigrams)) in file_trigrams.iter().enumerate() {
+        check_cancel(&cancel)?;
         let fid = file_id as u32;
         for tri in trigrams {
             let idx = (tri[0] as usize) << 16 | (tri[1] as usize) << 8 | tri[2] as usize;
@@ -787,15 +838,18 @@ fn initial_git_scan_with_progress(
     // Collect only non-empty trigrams into a HashMap for bulk_cold_index_direct.
     let mut trigram_map: std::collections::HashMap<[u8; 3], roaring::RoaringBitmap> =
         std::collections::HashMap::new();
-    for idx in 0..TRIGRAM_SPACE {
-        if !bitmaps[idx].is_empty() {
+    for (idx, bitmap) in bitmaps.iter_mut().enumerate() {
+        if idx % 65536 == 0 {
+            check_cancel(&cancel)?;
+        }
+        if !bitmap.is_empty() {
             let tri = [
                 (idx >> 16) as u8,
                 ((idx >> 8) & 0xFF) as u8,
                 (idx & 0xFF) as u8,
             ];
             // Move the bitmap out — avoid clone.
-            trigram_map.insert(tri, std::mem::take(&mut bitmaps[idx]));
+            trigram_map.insert(tri, std::mem::take(bitmap));
         }
     }
     drop(bitmaps); // free the 128 MB
@@ -826,11 +880,12 @@ fn initial_git_scan_with_progress(
                     "initial_git_scan: indexing {} dirty/untracked files from filesystem",
                     dirty_paths.len()
                 );
-                apply_changes_by_files_with_progress(
+                apply_changes_by_files_with_progress_cancel(
                     root,
                     &index,
                     dirty_paths,
                     Arc::clone(&progress),
+                    Arc::clone(&cancel),
                 )?;
             }
         }
@@ -882,11 +937,28 @@ fn collect_tree_blobs(
     }
 }
 
+#[cfg(test)]
 fn apply_changes_by_files_with_progress(
     root: &Path,
     index: &PersistentIndex,
     files: impl IntoIterator<Item = PathBuf>,
     progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+) -> Result<(), IndexError> {
+    apply_changes_by_files_with_progress_cancel(
+        root,
+        index,
+        files,
+        progress,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn apply_changes_by_files_with_progress_cancel(
+    root: &Path,
+    index: &PersistentIndex,
+    files: impl IntoIterator<Item = PathBuf>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), IndexError> {
     let exclude_dir = root.join(".source_fast");
     let git_dir = root.join(".git");
@@ -895,13 +967,19 @@ fn apply_changes_by_files_with_progress(
     let candidates: Vec<PathBuf> = files
         .into_iter()
         .filter(|path| {
-            path.starts_with(root) && !path.starts_with(&exclude_dir) && !path.starts_with(&git_dir)
+            let path_string = path.to_string_lossy();
+            path_is_within_root(&path_string, root)
+                && !path_is_within_root(&path_string, &exclude_dir)
+                && !path_is_within_root(&path_string, &git_dir)
         })
         .collect();
 
     let changed = AtomicUsize::new(0);
 
     candidates.par_iter().for_each(|path| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         if path.exists() {
             if !path.is_file() {
                 return;
@@ -931,6 +1009,8 @@ fn apply_changes_by_files_with_progress(
         }
     });
 
+    check_cancel(&cancel)?;
+
     let total_changed = changed.load(Ordering::Relaxed);
     if total_changed > 0 {
         index.flush()?;
@@ -958,6 +1038,16 @@ fn initial_scan_with_progress(
     index: Arc<PersistentIndex>,
     progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
 ) -> Result<(), IndexError> {
+    initial_scan_with_progress_cancel(root, index, progress, Arc::new(AtomicBool::new(false)))
+}
+
+fn initial_scan_with_progress_cancel(
+    root: &Path,
+    index: Arc<PersistentIndex>,
+    progress: Arc<dyn Fn(ScanEvent) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), IndexError> {
+    check_cancel(&cancel)?;
     info!("initial_scan: starting parallel walk at {}", root.display());
 
     let entries = collect_full_scan_entries(root)?;
@@ -977,6 +1067,9 @@ fn initial_scan_with_progress(
     let progress_for_scan = Arc::clone(&progress);
 
     entries.into_par_iter().for_each(|(path, bytes)| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let index = Arc::clone(&index_for_scan);
         let counter = Arc::clone(&counter_for_scan);
         let progress = Arc::clone(&progress_for_scan);
@@ -1000,6 +1093,8 @@ fn initial_scan_with_progress(
             bytes,
         });
     });
+
+    check_cancel(&cancel)?;
 
     debug!("initial_scan: parallel walk finished, flushing index");
     index.flush()?;

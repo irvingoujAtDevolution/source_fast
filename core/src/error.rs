@@ -16,6 +16,12 @@ pub enum IndexError {
 
     #[error("decode error: {0}")]
     Decode(String),
+
+    #[error("database map size exhausted")]
+    MapFull,
+
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl From<EncodeError> for IndexError {
@@ -32,6 +38,9 @@ impl From<DecodeError> for IndexError {
 
 impl From<heed::Error> for IndexError {
     fn from(err: heed::Error) -> Self {
+        if matches!(err, heed::Error::Mdb(heed::MdbError::MapFull)) {
+            return IndexError::MapFull;
+        }
         IndexError::Db(err.to_string())
     }
 }
