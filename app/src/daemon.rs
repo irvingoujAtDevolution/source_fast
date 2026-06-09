@@ -21,8 +21,11 @@ pub mod meta_keys {
 }
 
 pub mod index_status {
-    pub const BUILDING: &str = "building";
-    pub const COMPLETE: &str = "complete";
+    use source_fast_progress::IndexPhase;
+
+    pub const BUILDING: &str = IndexPhase::Building.as_str();
+    pub const COMPLETE: &str = IndexPhase::Complete.as_str();
+    pub const FAILED: &str = IndexPhase::Failed.as_str();
 }
 
 /// Information about a running daemon discovered from the leader table.
@@ -332,14 +335,16 @@ pub async fn run_daemon(root: PathBuf, db_path: PathBuf) -> Result<(), Box<dyn s
                             let _ = final_progress_tx.send(ScanEvent::Failed);
                             drop(final_progress_tx);
                             let _ = progress_thread.join();
-                            let _ = index_for_status.set_meta(meta_keys::INDEX_STATUS, "failed");
+                            let _ = index_for_status
+                                .set_meta(meta_keys::INDEX_STATUS, index_status::FAILED);
                             error!("daemon: initial index build failed: {err}");
                         }
                         Err(join_err) => {
                             let _ = final_progress_tx.send(ScanEvent::Failed);
                             drop(final_progress_tx);
                             let _ = progress_thread.join();
-                            let _ = index_for_status.set_meta(meta_keys::INDEX_STATUS, "failed");
+                            let _ = index_for_status
+                                .set_meta(meta_keys::INDEX_STATUS, index_status::FAILED);
                             error!("daemon: initial index task panicked: {join_err}");
                         }
                     }
@@ -641,7 +646,7 @@ pub fn wait_for_index_complete(db_path: &Path, timeout: Duration) -> bool {
             );
             return true;
         }
-        if index_status.as_deref() == Some("failed") {
+        if index_status.as_deref() == Some(index_status::FAILED) {
             warn!(
                 db = %db_path.display(),
                 elapsed_ms = start.elapsed().as_millis() as u64,

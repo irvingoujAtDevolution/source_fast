@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexPhase {
+    #[default]
+    Building,
+    Complete,
+    Failed,
+}
+
+impl IndexPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ScanMode {
     FullScan,
@@ -41,7 +64,7 @@ pub enum ScanEvent {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct IndexProgress {
-    pub phase: String,
+    pub phase: IndexPhase,
     pub mode: Option<String>,
     pub started_at_ms: Option<u64>,
     pub processed_files: usize,
@@ -55,7 +78,7 @@ pub struct IndexProgress {
 impl IndexProgress {
     pub fn building(started_at_ms: u64) -> Self {
         Self {
-            phase: "building".to_string(),
+            phase: IndexPhase::Building,
             started_at_ms: Some(started_at_ms),
             ..Default::default()
         }
@@ -64,7 +87,7 @@ impl IndexProgress {
     pub fn apply_event(&mut self, event: ScanEvent, now_ms: u64) {
         match event {
             ScanEvent::Started(plan) => {
-                self.phase = "building".to_string();
+                self.phase = IndexPhase::Building;
                 self.mode = Some(plan.mode.as_str().to_string());
                 self.started_at_ms = Some(now_ms);
                 self.processed_files = 0;
@@ -88,13 +111,30 @@ impl IndexProgress {
                 self.last_completed_path = Some(path);
             }
             ScanEvent::Finished => {
-                self.phase = "complete".to_string();
+                self.phase = IndexPhase::Complete;
                 self.current_path = None;
             }
             ScanEvent::Failed => {
-                self.phase = "failed".to_string();
+                self.phase = IndexPhase::Failed;
                 self.current_path = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_phase_uses_existing_wire_strings() {
+        let mut progress = IndexProgress::building(123);
+        progress.apply_event(ScanEvent::Finished, 456);
+
+        let json = serde_json::to_string(&progress).unwrap();
+        assert!(json.contains(r#""phase":"complete""#));
+
+        let decoded: IndexProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.phase, IndexPhase::Complete);
     }
 }

@@ -12,7 +12,7 @@ use source_fast_core::{
     rewrite_root_paths, search_database_file_filtered, search_files_in_database,
 };
 use source_fast_fs::smart_scan_with_progress;
-use source_fast_progress::{IndexProgress, ScanEvent};
+use source_fast_progress::{IndexPhase, IndexProgress, ScanEvent};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
@@ -147,7 +147,7 @@ struct WatchState {
     total_files: AtomicUsize,
     processed_bytes: AtomicU64,
     total_bytes: AtomicU64,
-    phase: Mutex<String>,
+    phase: Mutex<IndexPhase>,
     current_file: Mutex<String>,
     mode: Mutex<String>,
     started_at_ms: AtomicU64,
@@ -159,7 +159,7 @@ struct WatchSnapshot {
     total_files: Option<usize>,
     processed_bytes: u64,
     total_bytes: Option<u64>,
-    phase: String,
+    phase: IndexPhase,
     current_file: String,
     mode: String,
     started_at_ms: Option<u64>,
@@ -172,7 +172,7 @@ impl WatchState {
             total_files: AtomicUsize::new(0),
             processed_bytes: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
-            phase: Mutex::new("building".to_string()),
+            phase: Mutex::new(IndexPhase::Building),
             current_file: Mutex::new(String::new()),
             mode: Mutex::new("scanning".to_string()),
             started_at_ms: AtomicU64::new(0),
@@ -187,7 +187,7 @@ impl WatchState {
                 self.processed_bytes.store(0, Ordering::Relaxed);
                 self.total_bytes.store(plan.total_bytes, Ordering::Relaxed);
                 self.started_at_ms.store(now_ms(), Ordering::Relaxed);
-                *self.phase.lock().unwrap() = "building".to_string();
+                *self.phase.lock().unwrap() = IndexPhase::Building;
                 *self.mode.lock().unwrap() = plan.mode.as_str().to_string();
                 self.current_file.lock().unwrap().clear();
             }
@@ -204,16 +204,16 @@ impl WatchState {
                 *self.current_file.lock().unwrap() = path;
             }
             ScanEvent::Finished => {
-                *self.phase.lock().unwrap() = "complete".to_string();
+                *self.phase.lock().unwrap() = IndexPhase::Complete;
             }
             ScanEvent::Failed => {
-                *self.phase.lock().unwrap() = "failed".to_string();
+                *self.phase.lock().unwrap() = IndexPhase::Failed;
             }
         }
     }
 
-    fn set_phase(&self, phase: &str) {
-        *self.phase.lock().unwrap() = phase.to_string();
+    fn set_phase(&self, phase: IndexPhase) {
+        *self.phase.lock().unwrap() = phase;
     }
 
     fn snapshot(&self) -> WatchSnapshot {
@@ -226,7 +226,7 @@ impl WatchState {
             total_files: (total_files > 0).then_some(total_files),
             processed_bytes: self.processed_bytes.load(Ordering::Relaxed),
             total_bytes: (total_bytes > 0).then_some(total_bytes),
-            phase: self.phase.lock().unwrap().clone(),
+            phase: *self.phase.lock().unwrap(),
             current_file: self.current_file.lock().unwrap().clone(),
             mode: self.mode.lock().unwrap().clone(),
             started_at_ms: (started_at_ms > 0).then_some(started_at_ms),
@@ -236,7 +236,7 @@ impl WatchState {
 
 fn watch_snapshot_to_progress(snapshot: &WatchSnapshot) -> IndexProgress {
     IndexProgress {
-        phase: snapshot.phase.clone(),
+        phase: snapshot.phase,
         mode: Some(snapshot.mode.clone()),
         started_at_ms: snapshot.started_at_ms,
         processed_files: snapshot.processed_files,
@@ -315,9 +315,9 @@ fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String)
         _ => format_bytes(snapshot.processed_bytes),
     };
 
-    let eta_part = if snapshot.phase == "complete" {
+    let eta_part = if snapshot.phase == IndexPhase::Complete {
         "ETA done".to_string()
-    } else if snapshot.phase == "failed" {
+    } else if snapshot.phase == IndexPhase::Failed {
         "ETA failed".to_string()
     } else {
         // Use file-based throughput for ETA (more stable than byte-based
@@ -349,7 +349,7 @@ fn render_watch_frame(snapshot: &WatchSnapshot, tick: usize) -> (String, String)
         })
         .unwrap_or(0.0);
 
-    let spinner = if snapshot.phase == "building" {
+    let spinner = if snapshot.phase == IndexPhase::Building {
         SPINNER[(tick / 6) % SPINNER.len()]
     } else {
         " "
@@ -391,7 +391,7 @@ fn print_watch_summary(snapshot: &WatchSnapshot) {
     } else {
         0
     };
-    let status = if snapshot.phase == "complete" {
+    let status = if snapshot.phase == IndexPhase::Complete {
         "✓"
     } else {
         "✗"
@@ -401,7 +401,7 @@ fn print_watch_summary(snapshot: &WatchSnapshot) {
         snapshot.processed_files,
         format_bytes(snapshot.processed_bytes),
         format_eta(elapsed_secs),
-        if snapshot.phase == "complete" {
+        if snapshot.phase == IndexPhase::Complete {
             format!("{} files/sec", rate)
         } else {
             "before failing".to_string()
@@ -452,9 +452,15 @@ fn watch_progress_polling(db_path: &Path) {
 
         let line = match &progress {
             Some(p) => format_progress_line(p, &status),
-            None if status == "complete" => "\x1b[32m✓ Index complete.\x1b[0m".to_string(),
-            None if status == "failed" => "\x1b[31m✗ Index build failed.\x1b[0m".to_string(),
-            _ if status.is_empty() || status == "building" => "Waiting for daemon...".to_string(),
+            None if status == daemon::index_status::COMPLETE => {
+                "\x1b[32m✓ Index complete.\x1b[0m".to_string()
+            }
+            None if status == daemon::index_status::FAILED => {
+                "\x1b[31m✗ Index build failed.\x1b[0m".to_string()
+            }
+            _ if status.is_empty() || status == daemon::index_status::BUILDING => {
+                "Waiting for daemon...".to_string()
+            }
             None => "No index is being built.".to_string(),
         };
 
@@ -462,7 +468,7 @@ fn watch_progress_polling(db_path: &Path) {
         let truncated = truncate_to_display_width(&line, term_width);
         eprint!("\r\x1b[2K{truncated}");
 
-        if status == "complete" || status == "failed" {
+        if status == daemon::index_status::COMPLETE || status == daemon::index_status::FAILED {
             eprintln!();
             break;
         }
@@ -800,8 +806,31 @@ pub struct SearchOpts {
     pub count: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SearchOutputMode {
+    Text,
+    Json,
+    FilesOnly,
+    Count,
+}
+
+impl SearchOutputMode {
+    fn from_flags(count: bool, files_only: bool, json: bool) -> Self {
+        if count {
+            Self::Count
+        } else if files_only {
+            Self::FilesOnly
+        } else if json {
+            Self::Json
+        } else {
+            Self::Text
+        }
+    }
+}
+
 pub async fn run_search_with_daemon(opts: SearchOpts) -> Result<(), Box<dyn std::error::Error>> {
     let command_started = Instant::now();
+    let output_mode = SearchOutputMode::from_flags(opts.count, opts.files_only, opts.json);
     let root = resolve_root(opts.root);
     let db_path = opts.db.unwrap_or_else(|| default_db_path(&root));
     let query = opts.query;
@@ -899,29 +928,27 @@ pub async fn run_search_with_daemon(opts: SearchOpts) -> Result<(), Box<dyn std:
     let total = hits.len();
     let display_limit = if limit > 0 { limit } else { total };
 
-    // ---- --count mode: just print the number ----
-    if opts.count {
-        println!("{total}");
-        return Ok(());
-    }
-
-    // ---- --files-only mode: print paths, no snippets ----
-    if opts.files_only {
-        for (i, hit) in hits.iter().enumerate() {
-            if i >= display_limit {
-                break;
+    match output_mode {
+        SearchOutputMode::Count => {
+            println!("{total}");
+            return Ok(());
+        }
+        SearchOutputMode::FilesOnly => {
+            for (i, hit) in hits.iter().enumerate() {
+                if i >= display_limit {
+                    break;
+                }
+                println!("{}", clean_display_path(&hit.path));
             }
-            println!("{}", clean_display_path(&hit.path));
+            if total > display_limit {
+                eprintln!("... and {} more (use -l 0 for all)", total - display_limit);
+            }
+            return Ok(());
         }
-        if total > display_limit {
-            eprintln!("... and {} more (use -l 0 for all)", total - display_limit);
+        SearchOutputMode::Json => {
+            return print_json_results(&hits, &query, display_limit);
         }
-        return Ok(());
-    }
-
-    // ---- --json mode: structured output ----
-    if opts.json {
-        return print_json_results(&hits, &query, display_limit);
+        SearchOutputMode::Text => {}
     }
 
     // ---- Default: streaming rg-style output with snippets ----
@@ -1276,7 +1303,7 @@ pub async fn run_status(
                 if let Some(last) = progress.last_completed_path.as_deref() {
                     println!("Last file:    {last}");
                 }
-                if progress.phase == "complete" {
+                if progress.phase == IndexPhase::Complete {
                     println!("ETA:          done");
                 } else if let Some(eta) = estimate_eta_seconds(&progress) {
                     println!("ETA:          {}", format_eta(eta));
@@ -1419,7 +1446,7 @@ pub async fn run_index_watch(
             first_frame = false;
             tick = tick.wrapping_add(1);
 
-            if snapshot.phase == "complete" || snapshot.phase == "failed" {
+            if snapshot.phase.is_terminal() {
                 break;
             }
 
@@ -1436,7 +1463,9 @@ pub async fn run_index_watch(
             std::thread::sleep(Duration::from_secs(2));
             if matches!(
                 renew_index.get_meta(daemon::meta_keys::INDEX_STATUS),
-                Ok(Some(ref status)) if status == "complete" || status == "failed"
+                Ok(Some(ref status))
+                    if status == daemon::index_status::COMPLETE
+                        || status == daemon::index_status::FAILED
             ) {
                 break;
             }
@@ -1467,20 +1496,20 @@ pub async fn run_index_watch(
     };
 
     if renew_failed.load(Ordering::SeqCst) != 0 {
-        state.set_phase("failed");
+        state.set_phase(IndexPhase::Failed);
     } else if scan_result.is_ok() {
-        state.set_phase("complete");
+        state.set_phase(IndexPhase::Complete);
     } else {
-        state.set_phase("failed");
+        state.set_phase(IndexPhase::Failed);
     }
 
     let final_snapshot = state.snapshot();
     let final_progress = watch_snapshot_to_progress(&final_snapshot);
     queue_progress_meta(&index, &final_progress);
-    let final_status = if final_snapshot.phase == "complete" {
+    let final_status = if final_snapshot.phase == IndexPhase::Complete {
         daemon::index_status::COMPLETE
     } else {
-        "failed"
+        daemon::index_status::FAILED
     };
     let _ = index.set_meta_queued(daemon::meta_keys::INDEX_STATUS, final_status);
     let _ = index.flush();
@@ -1553,7 +1582,7 @@ fn format_progress_line(p: &IndexProgress, status: &str) -> String {
         })
         .unwrap_or_default();
 
-    let eta = if status == "complete" {
+    let eta = if status == daemon::index_status::COMPLETE {
         " done".to_string()
     } else {
         match estimate_eta_seconds(p) {

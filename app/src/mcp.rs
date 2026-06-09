@@ -218,6 +218,21 @@ fn build_mcp_file_filter(
     Ok(None)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum McpRole {
+    Reader,
+    Writer,
+}
+
+impl McpRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+        }
+    }
+}
+
 pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let root = resolve_root(root);
     let db_path = db.unwrap_or_else(|| default_db_path(&root));
@@ -241,7 +256,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
     let is_writer_for_task = Arc::clone(&is_writer);
 
     task::spawn(async move {
-        let mut role_logged: Option<&'static str> = None;
+        let mut role_logged: Option<McpRole> = None;
         let mut writer_started = false;
         let mut writer_cancel: Option<Arc<AtomicBool>> = None;
 
@@ -259,20 +274,20 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
                     election_index.set_write_enabled(true);
                     is_writer_for_task.store(true, Ordering::SeqCst);
                     role_logged = None;
-                    info!(role = "writer", "promoted role=writer");
+                    info!(role = McpRole::Writer.as_str(), "promoted role=writer");
                 } else {
                     election_index.set_write_enabled(false);
-                    if role_logged != Some("reader") {
-                        info!(role = "reader", "role selected role=reader");
-                        role_logged = Some("reader");
+                    if role_logged != Some(McpRole::Reader) {
+                        info!(role = McpRole::Reader.as_str(), "role selected role=reader");
+                        role_logged = Some(McpRole::Reader);
                     }
                 }
             }
 
             if is_writer_for_task.load(Ordering::SeqCst) {
-                if role_logged != Some("writer") {
-                    info!(role = "writer", "role selected role=writer");
-                    role_logged = Some("writer");
+                if role_logged != Some(McpRole::Writer) {
+                    info!(role = McpRole::Writer.as_str(), "role selected role=writer");
+                    role_logged = Some(McpRole::Writer);
                 }
 
                 if !writer_started {
@@ -348,7 +363,7 @@ pub async fn run_server(root: Option<PathBuf>, db: Option<PathBuf>) -> Result<()
                     writer_started = false;
                     election_ready.store(false, Ordering::SeqCst);
                     role_logged = None;
-                    info!(role = "reader", "demoted role=reader");
+                    info!(role = McpRole::Reader.as_str(), "demoted role=reader");
                 }
             }
 
